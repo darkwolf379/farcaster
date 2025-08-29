@@ -125,7 +125,7 @@ def format_duration(seconds):
         return f"{hours}h {minutes}m"
 
 def show_match_timing_info(match_data):
-    """Tampilkan info timing match"""
+    """Tampilkan info timing match dengan deteksi yang lebih akurat"""
     try:
         voting_start_str = match_data.get('votingStartTime')
         voting_end_str = match_data.get('votingEndTime') or match_data.get('endTime')
@@ -143,13 +143,82 @@ def show_match_timing_info(match_data):
             if now_utc < voting_start:
                 wait_time = (voting_start - now_utc).total_seconds()
                 print(f"⏳ Voting starts in: {format_duration(wait_time)}")
+                return 'waiting', wait_time
             elif voting_start <= now_utc <= voting_end:
                 remaining_time = (voting_end - now_utc).total_seconds()
                 print(f"✅ Voting is OPEN! Ends in: {format_duration(remaining_time)}")
+                return 'open', remaining_time
             else:
                 print("⌛ Voting window has CLOSED")
+                return 'closed', 0
+        else:
+            print("⚠️ No timing info available")
+            return 'unknown', 0
     except Exception as e:
         print(f"⚠️ Could not parse timing info: {e}")
+        return 'error', 0
+
+def wait_for_next_match(bot_instance, max_wait_minutes=30):
+    """Wait dan deteksi match baru dengan timing info"""
+    print(f"\n🔍 Checking for new match with timing info...")
+    
+    for attempt in range(max_wait_minutes):
+        try:
+            print(f"🔄 Attempt {attempt + 1}/{max_wait_minutes} - Checking match status...")
+            
+            # Get fresh match data
+            match_details = bot_instance.get_match_details()
+            if not match_details or 'data' not in match_details or not match_details['data']['matchData']:
+                print(f"⚠️ No match data available, waiting 1 minute...")
+                time.sleep(60)
+                continue
+            
+            current_match = match_details['data']['matchData'][0]
+            match_id = current_match.get('_id', 'Unknown')
+            
+            # Check timing info
+            status, wait_time = show_match_timing_info(current_match)
+            
+            if status == 'waiting':
+                print(f"⏳ Found new match {match_id[:10]}... starting in {format_duration(wait_time)}")
+                print(f"💤 Waiting until voting starts...")
+                
+                # Wait dengan countdown yang lebih akurat
+                voting_start_str = current_match.get('votingStartTime')
+                if voting_start_str:
+                    voting_start = parse_iso_time(voting_start_str)
+                    
+                    while datetime.datetime.now(pytz.UTC) < voting_start:
+                        remaining = (voting_start - datetime.datetime.now(pytz.UTC)).total_seconds()
+                        if remaining <= 0:
+                            break
+                        print(f"⏰ Voting starts in {format_duration(remaining)}", end='\r')
+                        time.sleep(min(30, remaining))
+                    
+                    print(f"\n🚀 Voting window opened for match {match_id[:10]}...!")
+                    return True, current_match
+                
+            elif status == 'open':
+                print(f"✅ Found active voting window for match {match_id[:10]}...!")
+                return True, current_match
+            
+            elif status == 'closed':
+                print(f"⌛ Match {match_id[:10]}... voting ended, looking for next...")
+                time.sleep(60)
+                continue
+                
+            else:
+                print(f"⚠️ Unknown match status, checking again in 1 minute...")
+                time.sleep(60)
+                continue
+                
+        except Exception as e:
+            print(f"❌ Error checking match: {e}, retrying in 1 minute...")
+            time.sleep(60)
+            continue
+    
+    print(f"❌ Could not find new match after {max_wait_minutes} minutes")
+    return False, None
 
 class FarcasterAutoVote:
     def __init__(self, authorization_token, fuel_amount=1, max_fuel=10, team_preference=None):
@@ -920,109 +989,224 @@ def process_single_account_vote(account_info, team_preference, fuel_strategy, cu
         print(f"❌ [Thread-{account_info['index']}] Error in account {account_info['index']}: {e}")
         return error_result
 
-def run_account_continuous_thread(account_info, thread_id):
-    """Run continuous voting untuk satu akun dalam thread terpisah"""
+def run_account_continuous_thread(account_info, thread_id, delay_config=None):
+    """Run continuous voting untuk satu akun dalam thread terpisah dengan enhanced match detection"""
     try:
         account = account_info[thread_id]
         fid = account['fid']
         token = account['token']
         fuel = account['fuel']
         
+        # Set unique random seed per thread untuk independent delays
+        import time
+        thread_seed = int(time.time() * 1000000) + thread_id * 1000 + account['index'] * 100
+        random.seed(thread_seed)
+        print(f"🎲 [Thread-{thread_id+1}] Initialized independent random seed: {thread_seed}")
+        
+        # Get delay configuration atau gunakan default
+        if delay_config:
+            min_delay = delay_config.get('min_delay', 30)
+            max_delay = delay_config.get('max_delay', 300)
+        else:
+            min_delay, max_delay = 30, 300  # Default threading delay
+        
         print(f"\n🧵 [Thread-{thread_id+1}] Starting continuous voting for Account {account['index']} (FID: {fid})")
+        print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Delay config: {format_duration(min_delay)} - {format_duration(max_delay)} (for continuous mode)', Colors.MAGENTA)}")
         
         # Initialize bot untuk account ini
         bot = FarcasterAutoVote(token, 1, 10, None)
         
-        cycle_count = 0
+        account_cycle_count = 0  # INDEPENDENT cycle counter per account
+        last_match_id = None  # Track match ID untuk deteksi match baru
+        is_first_vote = True  # Flag untuk voting pertama (no delay)
+        vote_delay_seconds = 0  # Default no delay untuk vote pertama
         
         while True:  # Continuous loop untuk account ini
             try:
-                cycle_count += 1
+                account_cycle_count += 1  # Independent counter
                 print(f"\n{colored_text('╔' + '═' * 68 + '╗', Colors.MAGENTA)}")
-                thread_text = f"🔄 [Thread-{thread_id+1}] CYCLE #{cycle_count} - Account {account['index']} (FID: {fid})"
+                thread_text = f"🔄 [Account-{account['index']}] Personal Cycle #{account_cycle_count} (FID: {fid})"
                 print(f"{colored_text('║', Colors.MAGENTA)} {colored_text(thread_text, Colors.BOLD + Colors.WHITE):>60} {colored_text('║', Colors.MAGENTA)}")
                 print(f"{colored_text('╚' + '═' * 68 + '╝', Colors.MAGENTA)}")
                 
                 current_fuel = bot.get_user_fuel_info()
-                print(f"{colored_text(f'⛽ [Thread-{thread_id+1}] Current fuel: {current_fuel}', Colors.GREEN)}")
+                print(f"{colored_text(f'⛽ [Account-{account['index']}] Current fuel: {current_fuel}', Colors.GREEN)}")
                 
                 # Get match details
                 match_details = bot.get_match_details()
                 if not match_details or 'data' not in match_details or not match_details['data']['matchData']:
-                    print(f"{colored_text(f'❌ [Thread-{thread_id+1}] No active match found, waiting 2 minutes...', Colors.RED)}")
+                    print(f"{colored_text(f'❌ [Account-{account['index']}] No active match found, waiting 2 minutes...', Colors.RED)}")
                     time.sleep(120)
                     continue
                 
                 current_match = match_details['data']['matchData'][0]
+                match_id = current_match.get('_id', 'Unknown')
                 
-                # Check if voting is open
-                timing_info = get_voting_timing(current_match)
-                if timing_info['status'] == 'open':
-                    print(f"{colored_text(f'✅ [Thread-{thread_id+1}] Voting is open, attempting to vote...', Colors.GREEN)}")
+                # Check if this is a new match
+                if last_match_id != match_id:
+                    print(f"{colored_text(f'🆕 [Account-{account['index']}] New match detected: {match_id[:10]}...', Colors.GREEN)}")
+                    last_match_id = match_id
                     
-                    # Try to vote
+                    if is_first_vote:
+                        # Voting pertama - TANPA delay
+                        vote_delay_seconds = 0
+                        print(f"{colored_text(f'🚀 [Account-{account['index']}] First vote - NO DELAY (immediate voting)', Colors.GREEN)}")
+                        is_first_vote = False
+                    else:
+                        # Continuous voting - DENGAN delay random
+                        vote_delay_seconds = random.randint(min_delay, max_delay)
+                        print(f"{colored_text(f'🎲 [Account-{account['index']}] Continuous mode delay: {format_duration(vote_delay_seconds)} after voting starts', Colors.MAGENTA)}")
+                
+                # PROPER timing detection dan handling
+                status, remaining_time = show_match_timing_info(current_match)
+                print(f"{colored_text(f'📊 [Account-{account['index']}] Match Status: {status.upper()}', Colors.CYAN)}")
+                
+                if status == 'waiting':
+                    print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting not started yet, waiting {format_duration(remaining_time)}...', Colors.YELLOW)}")
+                    
+                    # Wait dengan countdown yang akurat
+                    voting_start_str = current_match.get('votingStartTime')
+                    if voting_start_str:
+                        voting_start = parse_iso_time(voting_start_str)
+                        
+                        while datetime.datetime.now(pytz.UTC) < voting_start:
+                            remaining = (voting_start - datetime.datetime.now(pytz.UTC)).total_seconds()
+                            if remaining <= 0:
+                                break
+                            print(f"{colored_text(f'⏰ [Thread-{thread_id+1}] Voting starts in {format_duration(remaining)}', Colors.CYAN)}", end='\r')
+                            time.sleep(min(30, remaining))
+                        
+                        print(f"\n{colored_text(f'🚀 [Thread-{thread_id+1}] Voting window opened!', Colors.GREEN)}")
+                        
+                        # Apply delay logic berdasarkan first vote atau continuous
+                        if vote_delay_seconds > 0:
+                            print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Waiting random delay {format_duration(vote_delay_seconds)} before voting...', Colors.MAGENTA)}")
+                            
+                            # Countdown untuk random delay
+                            delay_remaining = vote_delay_seconds
+                            while delay_remaining > 0:
+                                print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting in {format_duration(delay_remaining)}', Colors.YELLOW)}", end='\r')
+                                sleep_time = min(10, delay_remaining)  # Update setiap 10 detik
+                                time.sleep(sleep_time)
+                                delay_remaining -= sleep_time
+                            
+                            print(f"\n{colored_text(f'🎯 [Thread-{thread_id+1}] Random delay finished, voting now!', Colors.GREEN)}")
+                        else:
+                            print(f"{colored_text(f'🎯 [Thread-{thread_id+1}] No delay - voting immediately!', Colors.GREEN)}")
+                    
+                elif status == 'open':
+                    print(f"{colored_text(f'✅ [Thread-{thread_id+1}] Voting is open!', Colors.GREEN)}")
+                    
+                    # Check berapa lama voting sudah berjalan dan apply delay logic
+                    voting_start_str = current_match.get('votingStartTime')
+                    if voting_start_str and vote_delay_seconds > 0:
+                        voting_start = parse_iso_time(voting_start_str)
+                        now_utc = datetime.datetime.now(pytz.UTC)
+                        time_since_start = (now_utc - voting_start).total_seconds()
+                        
+                        if time_since_start < vote_delay_seconds:
+                            # Masih dalam periode delay, tunggu sisa delay
+                            remaining_delay = vote_delay_seconds - time_since_start
+                            print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Waiting remaining delay {format_duration(remaining_delay)}...', Colors.MAGENTA)}")
+                            
+                            while remaining_delay > 0:
+                                print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting in {format_duration(remaining_delay)}', Colors.YELLOW)}", end='\r')
+                                sleep_time = min(10, remaining_delay)
+                                time.sleep(sleep_time)
+                                remaining_delay -= sleep_time
+                            
+                            print(f"\n{colored_text(f'🎯 [Thread-{thread_id+1}] Random delay finished, voting now!', Colors.GREEN)}")
+                        else:
+                            print(f"{colored_text(f'🎯 [Thread-{thread_id+1}] Delay period passed, voting immediately!', Colors.GREEN)}")
+                    else:
+                        print(f"{colored_text(f'🎯 [Thread-{thread_id+1}] No delay - voting immediately!', Colors.GREEN)}")
+                    
+                    # Try to vote setelah delay
                     success = bot.submit_prediction()
                     
                     if success:
-                        print(f"{colored_text(f'🎉 [Thread-{thread_id+1}] Vote submitted successfully! 🎯', Colors.BOLD + Colors.GREEN)}")
+                        print(f"{colored_text(f'🎉 [Account-{account['index']}] Vote submitted successfully! 🎯', Colors.BOLD + Colors.GREEN)}")
                         
-                        # Wait until voting ends
-                        if timing_info.get('remaining_vote_time'):
-                            wait_time = timing_info['remaining_vote_time']
-                            print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Waiting {format_duration(wait_time)} until voting ends...', Colors.YELLOW)}")
+                        # PROPER WAIT sampai voting ends dengan timing detection yang akurat
+                        print(f"{colored_text(f'⏳ [Account-{account['index']}] Now waiting until voting window completely ends...', Colors.YELLOW)}")
+                        
+                        voting_end_str = current_match.get('votingEndTime') or current_match.get('endTime')
+                        if voting_end_str:
+                            voting_end = parse_iso_time(voting_end_str)
                             
-                            # Sleep dengan progress indicator
-                            sleep_interval = min(60, wait_time / 10)
-                            slept = 0
-                            while slept < wait_time:
-                                remaining = wait_time - slept
-                                print(f"{colored_text(f'⏰ [Thread-{thread_id+1}] Next check in {format_duration(remaining)}', Colors.CYAN)}", end='\r')
-                                sleep_time = min(sleep_interval, remaining)
-                                time.sleep(sleep_time)
-                                slept += sleep_time
+                            # Real-time countdown sampai voting berakhir
+                            while datetime.datetime.now(pytz.UTC) < voting_end:
+                                remaining = (voting_end - datetime.datetime.now(pytz.UTC)).total_seconds()
                                 if remaining <= 0:
                                     break
+                                print(f"{colored_text(f'⏰ [Account-{account['index']}] Voting ends in {format_duration(remaining)}', Colors.CYAN)}")
+                                time.sleep(min(30, remaining))
                             
-                            print(f"\n{colored_text(f'🔄 [Thread-{thread_id+1}] Voting ended, looking for next match...', Colors.BLUE)}")
+                            print(f"\n{colored_text(f'✅ [Account-{account['index']}] Voting window ended! Searching for next match...', Colors.BLUE)}")
+                            
+                            # Wait for next match dengan proper detection
+                            print(f"{colored_text(f'🔍 [Account-{account['index']}] Intelligent next match detection...', Colors.CYAN)}")
+                            found_new_match, new_match_data = wait_for_next_match(bot, max_wait_minutes=30)
+                            
+                            if found_new_match:
+                                print(f"{colored_text(f'🎉 [Account-{account['index']}] Next match detected! Starting new personal cycle...', Colors.GREEN)}")
+                                last_match_id = None  # Reset untuk force detection match baru
+                                continue  # Langsung ke cycle berikutnya tanpa delay
+                            else:
+                                print(f"{colored_text(f'⚠️ [Account-{account['index']}] No next match found within 30 minutes, waiting 5 minutes before retry...', Colors.YELLOW)}")
+                                time.sleep(300)
                         else:
-                            print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Waiting 5 minutes before next check...', Colors.YELLOW)}")
+                            print(f"{colored_text(f'⚠️ [Account-{account['index']}] Could not get voting end time, waiting 5 minutes...', Colors.YELLOW)}")
                             time.sleep(300)
                     else:
-                        print(f"{colored_text(f'❌ [Thread-{thread_id+1}] Vote failed, waiting 2 minutes...', Colors.RED)}")
+                        print(f"{colored_text(f'❌ [Account-{account['index']}] Vote failed, waiting 2 minutes before retry...', Colors.RED)}")
                         time.sleep(120)
                         
-                elif timing_info['status'] == 'waiting':
-                    wait_time = timing_info.get('time_until_start', 300)
-                    print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting not started yet, waiting {format_duration(wait_time)}...', Colors.YELLOW)}")
-                    time.sleep(min(wait_time, 300))  # Max 5 minutes wait
+                elif status == 'closed':
+                    print(f"{colored_text(f'⌛ [Account-{account['index']}] Voting window has closed, searching for next match...', Colors.BLUE)}")
                     
-                elif timing_info['status'] == 'ended':
-                    print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting ended, waiting for next match...', Colors.BLUE)}")
-                    time.sleep(300)  # Wait 5 minutes
+                    # Wait for next match dengan intelligent detection
+                    print(f"{colored_text(f'🔍 [Account-{account['index']}] Intelligent next match detection...', Colors.CYAN)}")
+                    found_new_match, new_match_data = wait_for_next_match(bot, max_wait_minutes=30)
+                    
+                    if found_new_match:
+                        print(f"{colored_text(f'🎉 [Account-{account['index']}] Next match detected! Starting new personal cycle...', Colors.GREEN)}")
+                        last_match_id = None  # Reset untuk force detection match baru
+                        continue  # Langsung ke cycle berikutnya
+                    else:
+                        print(f"{colored_text(f'⚠️ [Account-{account['index']}] No next match found within 30 minutes, waiting 5 minutes...', Colors.YELLOW)}")
+                        time.sleep(300)
+                    
                 else:
-                    print(f"{colored_text(f'⚠️  [Thread-{thread_id+1}] Unknown timing status, waiting 2 minutes...', Colors.YELLOW)}")
+                    print(f"{colored_text(f'⚠️ [Account-{account['index']}] Unknown timing status: {status}, waiting 2 minutes...', Colors.YELLOW)}")
                     time.sleep(120)
                     
-                # Small delay before next cycle
+                # Small delay before next cycle check (hanya jika tidak continue)
                 time.sleep(5)
                 
             except Exception as e:
-                print(f"{colored_text(f'❌ [Thread-{thread_id+1}] Error in cycle: {e}', Colors.RED)}")
+                print(f"{colored_text(f'❌ [Account-{account['index']}] Error in personal cycle #{account_cycle_count}: {e}', Colors.RED)}")
                 time.sleep(60)  # Wait 1 minute on error
                 
     except KeyboardInterrupt:
         account_index = account.get('index', 'Unknown')
-        print(f"\n{colored_text(f'⛔ [Thread-{thread_id+1}] Account {account_index} thread stopped by user', Colors.BOLD + Colors.RED)}")
+        print(f"\n{colored_text(f'⛔ [Account-{account_index}] Personal thread stopped by user after {account_cycle_count} cycles', Colors.BOLD + Colors.RED)}")
     except Exception as e:
-        print(f"\n{colored_text(f'❌ [Thread-{thread_id+1}] Thread error: {e}', Colors.RED)}")
+        print(f"\n{colored_text(f'❌ [Account-{account['index']}] Personal thread error: {e}', Colors.RED)}")
 
-def threaded_continuous_multi_account_vote(active_accounts):
+def threaded_continuous_multi_account_vote(active_accounts, delay_config=None):
     """Run multi-account voting dengan threading - setiap akun punya continuous loop sendiri"""
     import threading
     
     print(f"\n🧵 Starting threaded continuous voting for {len(active_accounts)} accounts...")
     print("⚠️  Each account will run in its own continuous loop")
     print("⚠️  Press Ctrl+C to stop all threads")
+    
+    # Show delay configuration
+    if delay_config:
+        min_delay = delay_config.get('min_delay', 30)
+        max_delay = delay_config.get('max_delay', 300)
+        print(f"🎲 Random delay range: {format_duration(min_delay)} - {format_duration(max_delay)}")
     
     threads = []
     
@@ -1031,7 +1215,7 @@ def threaded_continuous_multi_account_vote(active_accounts):
         for i, account in enumerate(active_accounts):
             thread = threading.Thread(
                 target=run_account_continuous_thread,
-                args=(active_accounts, i),
+                args=(active_accounts, i, delay_config),
                 daemon=True,
                 name=f"Account-{account['index']}-Thread"
             )
@@ -1054,7 +1238,7 @@ def threaded_continuous_multi_account_vote(active_accounts):
     except Exception as e:
         print(f"\n❌ Threading error: {e}")
 
-def threaded_multi_account_vote(account_info_list, use_threading=False):
+def threaded_multi_account_vote(account_info_list, use_threading=False, delay_config=None):
     """Multi-account voting dengan opsi threading"""
     print(f"\n🚀 Starting {'threaded' if use_threading else 'sequential'} multi-account voting...")
     print("=" * 60)
@@ -1178,79 +1362,81 @@ def threaded_multi_account_vote(account_info_list, use_threading=False):
                     result = process_single_account_vote(acc_info, team_preference, fuel_strategy, custom_fuel, results_queue)
                     all_results.append(result)
             
-            # Summary results
-            successful_votes = sum(1 for r in all_results if r['success'])
-            total_votes = sum(r.get('votes_count', 0) for r in all_results)
-            
-            print(f"\n{colored_text('╔' + '═' * 68 + '╗', Colors.MAGENTA)}")
-            print(f"{colored_text('║', Colors.MAGENTA)} {colored_text(f'📊 CYCLE #{vote_cycle} SUMMARY', Colors.BOLD + Colors.WHITE):>50} {colored_text('║', Colors.MAGENTA)}")
-            print(f"{colored_text('╚' + '═' * 68 + '╝', Colors.MAGENTA)}")
-            print(f"{colored_text(f'✅ Successful accounts: {successful_votes}/{len(account_info_list)}', Colors.GREEN)}")
-            print(f"{colored_text(f'🗳️  Total votes submitted: {total_votes}', Colors.CYAN)}")
-            
-            # Detail per account dengan border
-            print(f"\n{colored_text('┌─ Account Details ─' + '─' * 47 + '┐', Colors.YELLOW)}")
-            for result in sorted(all_results, key=lambda x: x['account_index']):
-                status_color = Colors.GREEN if result['success'] else Colors.RED
-                status = "✅ Success" if result['success'] else "❌ Failed"
-                votes = result.get('votes_count', 0)
-                error = f" - {result.get('error', '')}" if 'error' in result else ""
-                account_line = f"Account {result['account_index']} (FID: {result['fid']}): {status} ({votes} votes){error}"
-                print(f"{colored_text('│', Colors.YELLOW)} {colored_text(account_line, status_color):<60} {colored_text('│', Colors.YELLOW)}")
-            print(f"{colored_text('└' + '─' * 68 + '┘', Colors.YELLOW)}")
-            
-            if successful_votes > 0:
-                # Get timing info from first successful account
-                try:
-                    first_successful_token = next(acc['token'] for acc in account_info_list 
-                                                if any(r['account_index'] == acc['index'] and r['success'] for r in all_results))
-                    temp_bot = FarcasterAutoVote(first_successful_token, 1, 10, None)
-                    match_details = temp_bot.get_match_details()
-                    
-                    if match_details and 'data' in match_details and match_details['data']['matchData']:
-                        current_match = match_details['data']['matchData'][0]
+                # Summary results
+                successful_votes = sum(1 for r in all_results if r['success'])
+                total_votes = sum(r.get('votes_count', 0) for r in all_results)
+                
+                print(f"\n{colored_text('╔' + '═' * 68 + '╗', Colors.MAGENTA)}")
+                print(f"{colored_text('║', Colors.MAGENTA)} {colored_text(f'📊 CYCLE #{vote_cycle} SUMMARY', Colors.BOLD + Colors.WHITE):>50} {colored_text('║', Colors.MAGENTA)}")
+                print(f"{colored_text('╚' + '═' * 68 + '╝', Colors.MAGENTA)}")
+                print(f"{colored_text(f'✅ Successful accounts: {successful_votes}/{len(account_info_list)}', Colors.GREEN)}")
+                print(f"{colored_text(f'🗳️  Total votes submitted: {total_votes}', Colors.CYAN)}")
+                
+                # Detail per account dengan border
+                print(f"\n{colored_text('┌─ Account Details ─' + '─' * 47 + '┐', Colors.YELLOW)}")
+                for result in sorted(all_results, key=lambda x: x['account_index']):
+                    status_color = Colors.GREEN if result['success'] else Colors.RED
+                    status = "✅ Success" if result['success'] else "❌ Failed"
+                    votes = result.get('votes_count', 0)
+                    error = f" - {result.get('error', '')}" if 'error' in result else ""
+                    account_line = f"Account {result['account_index']} (FID: {result['fid']}): {status} ({votes} votes){error}"
+                    print(f"{colored_text('│', Colors.YELLOW)} {colored_text(account_line, status_color):<60} {colored_text('│', Colors.YELLOW)}")
+                print(f"{colored_text('└' + '─' * 68 + '┘', Colors.YELLOW)}")
+                
+                if successful_votes > 0:
+                    # Get timing info from first successful account dengan deteksi yang lebih baik
+                    try:
+                        first_successful_token = next(acc['token'] for acc in account_info_list 
+                                                    if any(r['account_index'] == acc['index'] and r['success'] for r in all_results))
+                        temp_bot = FarcasterAutoVote(first_successful_token, 1, 10, None)
+                        match_details = temp_bot.get_match_details()
                         
-                        # Calculate wait time until voting ends - try multiple field names
-                        voting_end_str = current_match.get('votingEndTime') or current_match.get('endTime') or current_match.get('votingEnd')
-                        if voting_end_str:
-                            voting_end = parse_iso_time(voting_end_str)
-                            now_utc = datetime.datetime.now(pytz.UTC)
+                        if match_details and 'data' in match_details and match_details['data']['matchData']:
+                            current_match = match_details['data']['matchData'][0]
                             
-                            if now_utc < voting_end:
-                                wait_until_end = (voting_end - now_utc).total_seconds()
-                                print(f"\n⏳ Waiting {format_duration(wait_until_end)} until voting ends...")
+                            # Show timing info dan get status
+                            status, remaining_time = show_match_timing_info(current_match)
+                            
+                            if status == 'open' and remaining_time > 0:
+                                print(f"\n⏳ Waiting {format_duration(remaining_time)} until voting ends...")
                                 print("💤 All accounts voted, sleeping until next voting window...")
                                 
-                                # Sleep dengan progress indicator
-                                sleep_interval = min(60, wait_until_end / 10)
-                                slept = 0
-                                while slept < wait_until_end:
-                                    remaining = wait_until_end - slept
-                                    print(f"⏰ Next check in {format_duration(remaining)}", end='\r')
-                                    sleep_time = min(sleep_interval, remaining)
-                                    time.sleep(sleep_time)
-                                    slept += sleep_time
-                                    if remaining <= 0:
-                                        break
+                                # Sleep dengan countdown yang akurat
+                                voting_end_str = current_match.get('votingEndTime') or current_match.get('endTime')
+                                if voting_end_str:
+                                    voting_end = parse_iso_time(voting_end_str)
+                                    
+                                    while datetime.datetime.now(pytz.UTC) < voting_end:
+                                        remaining = (voting_end - datetime.datetime.now(pytz.UTC)).total_seconds()
+                                        if remaining <= 0:
+                                            break
+                                        print(f"⏰ Voting ends in {format_duration(remaining)}", end='\r')
+                                        time.sleep(min(30, remaining))
                                 
                                 print(f"\n🔄 Voting window ended, looking for next match...")
+                            
+                            # Wait for next match dengan deteksi timing yang akurat
+                            print(f"\n{colored_text('🔍 NEXT MATCH DETECTION', Colors.BOLD + Colors.BLUE)}")
+                            print(f"{colored_text('⚡ Starting intelligent match detection...', Colors.CYAN)}")
+                            
+                            # Wait dan deteksi match berikutnya
+                            found_new_match, new_match_data = wait_for_next_match(temp_bot, max_wait_minutes=30)
+                            
+                            if found_new_match and new_match_data:
+                                print(f"{colored_text('🎉 New match detected! Continuing with next cycle...', Colors.GREEN)}")
                             else:
-                                print("🔄 Voting already ended, looking for next match...")
+                                print(f"{colored_text('⚠️ No new match found, waiting 5 minutes before retry...', Colors.YELLOW)}")
+                                time.sleep(300)
                         else:
-                            print("⚠️  Could not get voting end time, waiting 5 minutes...")
-                            time.sleep(300)
-                    else:
-                        print("⚠️  Could not get match details, waiting 2 minutes...")
+                            print("⚠️  Could not get match details, waiting 2 minutes...")
+                            time.sleep(120)
+                            
+                    except Exception as e:
+                        print(f"⚠️  Error getting timing info: {e}, waiting 2 minutes...")
                         time.sleep(120)
-                        
-                except Exception as e:
-                    print(f"⚠️  Error getting timing info: {e}, waiting 2 minutes...")
-                    time.sleep(120)
-            else:
-                print("💡 All votes failed, checking again in 2 minutes...")
-                time.sleep(120)
-                    
-            # Small delay before next cycle
+                else:
+                    print("💡 All votes failed, checking again in 2 minutes...")
+                    time.sleep(120)            # Small delay before next cycle
             print("\n" + "="*60)
             time.sleep(5)
                 
@@ -1262,7 +1448,7 @@ def threaded_multi_account_vote(account_info_list, use_threading=False):
         print(f"\n❌ Unexpected error in {'threaded' if use_threading else 'sequential'} vote: {e}")
         print(f"📊 Total vote cycles: {vote_cycle}")
 
-def continuous_multi_account_vote(account_info):
+def continuous_multi_account_vote(account_info, delay_config=None):
     """Continuous auto vote untuk multi account dengan match timing"""
     print("\n🔄 CONTINUOUS MULTI-ACCOUNT AUTO VOTE MODE")
     print("=" * 60)
@@ -1273,6 +1459,14 @@ def continuous_multi_account_vote(account_info):
     print("   • Loop terus menerus berdasarkan timing")
     print("   • Press Ctrl+C untuk stop")
     print(f"📊 Total accounts: {len(account_info)}")
+    
+    # Get delay configuration atau gunakan default
+    if delay_config:
+        min_delay = delay_config.get('min_delay', 5)
+        max_delay = delay_config.get('max_delay', 180)
+        print(f"🎲 Custom delay range: {format_duration(min_delay)} - {format_duration(max_delay)}")
+    else:
+        min_delay, max_delay = 5, 180  # Default sequential delay
     
     # Filter account yang punya fuel
     active_accounts = [acc for acc in account_info if acc['fuel'] > 0]
@@ -1329,6 +1523,7 @@ def continuous_multi_account_vote(account_info):
         return
     
     vote_cycle = 0
+    is_first_vote_cycle = True  # Flag untuk cycle pertama (no delay)
     
     try:
         while True:
@@ -1400,12 +1595,32 @@ def continuous_multi_account_vote(account_info):
                 time.sleep(60)
                 continue
             
-            # Vote semua account
+            # Vote semua account dengan random delay per account
             print(f"\n{colored_text('╔' + '═' * 68 + '╗', Colors.GREEN)}")
             print(f"{colored_text('║', Colors.GREEN)} {colored_text(f'🗳️ Starting vote cycle #{vote_cycle} for all accounts...', Colors.BOLD + Colors.WHITE):>60} {colored_text('║', Colors.GREEN)}")
             print(f"{colored_text('╚' + '═' * 68 + '╝', Colors.GREEN)}")
             successful_votes = 0
             failed_votes = 0
+            
+            # Generate random delays untuk setiap account dengan custom config
+            account_delays = {}
+            
+            if is_first_vote_cycle:
+                # Cycle pertama - TANPA delay untuk semua account
+                print(f"🚀 First vote cycle - NO DELAY for all accounts (immediate voting)")
+                for acc in active_accounts:
+                    account_delays[acc['index']] = 0
+                is_first_vote_cycle = False
+            else:
+                # Continuous cycles - DENGAN delay random
+                print(f"🎲 Continuous cycle - Random delays applied:")
+                for i, acc in enumerate(active_accounts):
+                    # Set unique seed per account per cycle untuk true randomness
+                    account_seed = int(time.time() * 1000) + vote_cycle * 1000 + acc['index'] * 100 + i
+                    random.seed(account_seed)
+                    delay = random.randint(min_delay, max_delay)  # Gunakan custom config
+                    account_delays[acc['index']] = delay
+                    print(f"🎲 Account {acc['index']} random delay: {format_duration(delay)}")
             
             for acc in active_accounts[:]:  # Copy list untuk avoid modification during iteration
                 print(f"\n{colored_text('┌─ Account Status ─' + '─' * 49 + '┐', Colors.CYAN)}")
@@ -1436,6 +1651,23 @@ def continuous_multi_account_vote(account_info):
                     
                     print(f"{colored_text(f'🎯 Using {fuel_to_use} fuel for this vote', Colors.YELLOW)}")
                     
+                    # TAMBAHAN: Random delay sebelum vote (hanya jika ada delay)
+                    delay_time = account_delays[acc_index]
+                    if delay_time > 0:
+                        print(f"{colored_text(f'🎲 Random delay: {format_duration(delay_time)} before voting...', Colors.MAGENTA)}")
+                        
+                        # Countdown untuk delay
+                        remaining_delay = delay_time
+                        while remaining_delay > 0:
+                            print(f"{colored_text(f'⏳ Account {acc_index} voting in {format_duration(remaining_delay)}', Colors.CYAN)}", end='\r')
+                            sleep_time = min(5, remaining_delay)  # Update setiap 5 detik
+                            time.sleep(sleep_time)
+                            remaining_delay -= sleep_time
+                        
+                        print(f"\n{colored_text(f'🎯 Account {acc_index}: Random delay finished, voting now!', Colors.GREEN)}")
+                    else:
+                        print(f"{colored_text(f'🎯 Account {acc_index}: No delay - voting immediately!', Colors.GREEN)}")
+                    
                     # Attempt vote
                     bot = FarcasterAutoVote(acc['token'], fuel_to_use, current_fuel, team_preference)
                     success = bot.run_auto_vote()
@@ -1464,33 +1696,46 @@ def continuous_multi_account_vote(account_info):
             print(f"{colored_text('╚' + '═' * 68 + '╝', Colors.MAGENTA)}")
             
             if successful_votes > 0:
-                # Show timing info
-                show_match_timing_info(current_match)
+                # Show timing info dan get status
+                status, remaining_time = show_match_timing_info(current_match)
                 
-                # Calculate wait time until voting ends
-                now_utc = datetime.datetime.now(pytz.UTC)
-                if now_utc < voting_end:
-                    wait_until_end = (voting_end - now_utc).total_seconds()
+                if status == 'open' and remaining_time > 0:
                     print(f"\n{colored_text('┌─ Waiting Status ─' + '─' * 48 + '┐', Colors.YELLOW)}")
-                    print(f"{colored_text('│', Colors.YELLOW)} {colored_text(f'⏳ Waiting {format_duration(wait_until_end)} until voting ends...', Colors.WHITE):<60} {colored_text('│', Colors.YELLOW)}")
+                    print(f"{colored_text('│', Colors.YELLOW)} {colored_text(f'⏳ Waiting {format_duration(remaining_time)} until voting ends...', Colors.WHITE):<60} {colored_text('│', Colors.YELLOW)}")
                     print(f"{colored_text('│', Colors.YELLOW)} {colored_text('💤 All accounts voted, sleeping until next voting window...', Colors.CYAN):<60} {colored_text('│', Colors.YELLOW)}")
                     print(f"{colored_text('└' + '─' * 68 + '┘', Colors.YELLOW)}")
                     
-                    # Sleep dengan progress indicator
-                    sleep_interval = min(60, wait_until_end / 10)  # Update setiap menit atau 10% dari waktu
-                    slept = 0
-                    while slept < wait_until_end:
-                        remaining = wait_until_end - slept
-                        print(f"{colored_text(f'⏰ Next check in {format_duration(remaining)}', Colors.YELLOW)}", end='\r')
-                        sleep_time = min(sleep_interval, remaining)
-                        time.sleep(sleep_time)
-                        slept += sleep_time
-                        if remaining <= 0:
-                            break
+                    # Sleep dengan progress indicator sampai voting ends
+                    voting_end_str = current_match.get('votingEndTime') or current_match.get('endTime')
+                    if voting_end_str:
+                        voting_end = parse_iso_time(voting_end_str)
+                        
+                        while datetime.datetime.now(pytz.UTC) < voting_end:
+                            remaining = (voting_end - datetime.datetime.now(pytz.UTC)).total_seconds()
+                            if remaining <= 0:
+                                break
+                            print(f"{colored_text(f'⏰ Voting ends in {format_duration(remaining)}', Colors.YELLOW)}", end='\r')
+                            time.sleep(min(30, remaining))
                     
-                    print(f"\n🔄 Voting window ended, looking for next match...")
+                    print(f"\n🔄 Voting window ended, checking for next match...")
+                    
+                # Wait for next match dengan deteksi timing yang akurat
+                print(f"\n{colored_text('🔍 NEXT MATCH DETECTION', Colors.BOLD + Colors.BLUE)}")
+                print(f"{colored_text('⚡ Starting intelligent match detection...', Colors.CYAN)}")
+                
+                # Setup bot untuk deteksi match berikutnya
+                temp_bot = FarcasterAutoVote(active_accounts[0]['token'], 1, 10, None)
+                
+                # Wait dan deteksi match berikutnya
+                found_new_match, new_match_data = wait_for_next_match(temp_bot, max_wait_minutes=30)
+                
+                if found_new_match and new_match_data:
+                    print(f"{colored_text('🎉 New match detected! Continuing with next cycle...', Colors.GREEN)}")
+                    # Update current_match untuk cycle berikutnya
+                    current_match = new_match_data
                 else:
-                    print("🔄 Voting already ended, looking for next match...")
+                    print(f"{colored_text('⚠️ No new match found, waiting 5 minutes before retry...', Colors.YELLOW)}")
+                    time.sleep(300)
                     
             else:
                 print("💡 All votes failed, checking again in 2 minutes...")
@@ -1644,12 +1889,89 @@ def main():
     use_threading_input = input("\nUse multi-threading? (y/n): ").strip().lower()
     use_threading = use_threading_input in ['y', 'yes', '1', 'true']
     
+    # Custom delay configuration
+    print(f"\n🎲 CUSTOM RANDOM DELAY CONFIGURATION:")
+    print("Configure random delay interval setelah voting starts untuk anti-bot detection")
+    
+    if use_threading:
+        print(f"\n⚙️ THREADING MODE DELAY:")
+        print("1. Quick (30 seconds - 2 minutes)")
+        print("2. Normal (30 seconds - 5 minutes)  [Default]")
+        print("3. Safe (1 minute - 8 minutes)")
+        print("4. Conservative (2 minutes - 10 minutes)")
+        print("5. Custom Range")
+        
+        delay_choice = input("\nPilih delay range (1/2/3/4/5): ").strip()
+        
+        if delay_choice == "1":
+            min_delay, max_delay = 30, 120  # 30s - 2m
+        elif delay_choice == "3":
+            min_delay, max_delay = 60, 480  # 1m - 8m
+        elif delay_choice == "4":
+            min_delay, max_delay = 120, 600  # 2m - 10m
+        elif delay_choice == "5":
+            try:
+                min_delay = int(input("Minimum delay (seconds): ") or "30")
+                max_delay = int(input("Maximum delay (seconds): ") or "300")
+                if min_delay >= max_delay:
+                    print("⚠️ Invalid range, using default")
+                    min_delay, max_delay = 30, 300
+            except ValueError:
+                print("⚠️ Invalid input, using default")
+                min_delay, max_delay = 30, 300
+        else:
+            min_delay, max_delay = 30, 300  # Default: 30s - 5m
+            
+    else:
+        print(f"\n⚙️ SEQUENTIAL MODE DELAY:")
+        print("1. Quick (5 seconds - 1 minute)")
+        print("2. Normal (5 seconds - 3 minutes)  [Default]")
+        print("3. Safe (10 seconds - 5 minutes)")
+        print("4. Conservative (30 seconds - 8 minutes)")
+        print("5. Custom Range")
+        
+        delay_choice = input("\nPilih delay range (1/2/3/4/5): ").strip()
+        
+        if delay_choice == "1":
+            min_delay, max_delay = 5, 60    # 5s - 1m
+        elif delay_choice == "3":
+            min_delay, max_delay = 10, 300  # 10s - 5m
+        elif delay_choice == "4":
+            min_delay, max_delay = 30, 480  # 30s - 8m
+        elif delay_choice == "5":
+            try:
+                min_delay = int(input("Minimum delay (seconds): ") or "5")
+                max_delay = int(input("Maximum delay (seconds): ") or "180")
+                if min_delay >= max_delay:
+                    print("⚠️ Invalid range, using default")
+                    min_delay, max_delay = 5, 180
+            except ValueError:
+                print("⚠️ Invalid input, using default")
+                min_delay, max_delay = 5, 180
+        else:
+            min_delay, max_delay = 5, 180   # Default: 5s - 3m
+    
+    print(f"\n✅ DELAY CONFIGURATION:")
+    print(f"🎲 Random delay range: {format_duration(min_delay)} - {format_duration(max_delay)}")
+    print(f"🎯 Mode: {'Threading' if use_threading else 'Sequential'}")
+    
+    # Pass delay configuration to voting functions
+    delay_config = {'min_delay': min_delay, 'max_delay': max_delay}
+    
     if use_threading:
         print("🧵 Using threaded execution mode...")
-        threaded_multi_account_vote(account_info, use_threading=True)
+        print("🎯 Each account will have independent continuous cycles...")
+        
+        # Filter active accounts untuk threading
+        active_accounts = [acc for acc in account_info if acc['fuel'] > 0]
+        if not active_accounts:
+            print("❌ No accounts with fuel available!")
+            return
+            
+        threaded_continuous_multi_account_vote(active_accounts, delay_config=delay_config)
     else:
         print("🔄 Using sequential execution mode...")
-        continuous_multi_account_vote(account_info)
+        continuous_multi_account_vote(account_info, delay_config=delay_config)
 
 if __name__ == "__main__":
     main()
