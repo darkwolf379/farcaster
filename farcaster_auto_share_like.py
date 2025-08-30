@@ -11,6 +11,8 @@ import random
 import threading
 import uuid
 import os
+import signal
+import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 import queue
@@ -190,22 +192,22 @@ class FarcasterAutoShareLike:
     def generate_share_text(self, share_number=1):
         """Generate varied text for shares"""
         base_texts = [
-            "Help me get Fuel by liking this cast! 🔋\\n5 Likes = 1 Fuel\\nSupport my mech battles in Wreck League Versus 🤖",
-            "Need fuel for my mech! ⚡\\nLike this cast to help me fight in Wreck League! 🤖\\n5 likes = 1 fuel ⛽",
-            "Powering up my mech for battle! 🚀\\nYour like = My fuel ⛽\\nJoin the Wreck League action! 🤖",
-            "Fuel needed for epic mech battles! 🔥\\nEvery like counts! 👍\\nWreck League awaits! ⚔️",
-            "My mech needs energy! ⚡\\nHelp me by liking this cast! 🔋\\nWreck League versus mode activated! 🤖",
-            "Battle-ready mech seeking fuel! 🛡️\\nYour support powers my victories! 🏆\\n5 likes = 1 precious fuel ⛽",
-            "Charging up for the next fight! ⚡\\nLike = Fuel = Victory! 🎯\\nWreck League champion in the making! 🤖",
-            "Fuel crisis! SOS! 🆘\\nNeed likes to power my mech! 🔋\\nEvery like brings me closer to victory! 🏅"
+            "Help me get Fuel by liking this cast! 🔋\n5 Likes = 1 Fuel\nSupport my mech battles in Wreck League Versus 🤖",
+            "Need fuel for my mech! ⚡\nLike this cast to help me fight in Wreck League! 🤖\n5 likes = 1 fuel ⛽",
+            "Powering up my mech for battle! 🚀\nYour like = My fuel ⛽\nJoin the Wreck League action! 🤖",
+            "Fuel needed for epic mech battles! 🔥\nEvery like counts! 👍\nWreck League awaits! ⚔️",
+            "My mech needs energy! ⚡\nHelp me by liking this cast! 🔋\nWreck League versus mode activated! 🤖",
+            "Battle-ready mech seeking fuel! 🛡️\nYour support powers my victories! 🏆\n5 likes = 1 precious fuel ⛽",
+            "Charging up for the next fight! ⚡\nLike = Fuel = Victory! 🎯\nWreck League champion in the making! 🤖",
+            "Fuel crisis! SOS! 🆘\nNeed likes to power my mech! 🔋\nEvery like brings me closer to victory! 🏅"
         ]
         
         variations = [
-            "\\n\\n🎮 Join the battle: ",
-            "\\n\\n⚔️ Fight with me: ",
-            "\\n\\n🤖 Mech arena: ",
-            "\\n\\n🔥 Battle zone: ",
-            "\\n\\n⚡ Energy boost: "
+            "\n\n🎮 Join the battle: ",
+            "\n\n⚔️ Fight with me: ",
+            "\n\n🤖 Mech arena: ",
+            "\n\n🔥 Battle zone: ",
+            "\n\n⚡ Energy boost: "
         ]
         
         # Select base text and variation
@@ -221,7 +223,7 @@ class FarcasterAutoShareLike:
             
         # Add share number if multiple shares
         if share_number > 1:
-            final_text += f"\\n\\n📊 Share #{share_number}"
+            final_text += f"\n\n📊 Share #{share_number}"
             
         return final_text
 
@@ -389,6 +391,9 @@ class FarcasterAutoShareLike:
     def run_share_cycle(self, num_shares=5, delay_range=(10, 30)):
         """Run a complete share cycle for this account"""
         try:
+            if shutdown_flag.is_set():
+                return []
+                
             print(f"\n{colored_text(f'🚀 Account {self.account_index}: Starting share cycle ({num_shares} shares)', Colors.BOLD + Colors.CYAN)}")
             
             shares_data = []
@@ -399,6 +404,9 @@ class FarcasterAutoShareLike:
             
             # Post shares with delays
             for i in range(1, num_shares + 1):
+                if shutdown_flag.is_set():
+                    break
+                    
                 share_result = self.post_share_cast(i)
                 shares_data.append(share_result)
                 
@@ -406,7 +414,12 @@ class FarcasterAutoShareLike:
                 if i < num_shares:
                     delay = random.uniform(delay_range[0], delay_range[1])
                     print(f"{colored_text(f'⏳ Account {self.account_index}: Waiting {delay:.1f}s before next share...', Colors.CYAN)}")
-                    time.sleep(delay)
+                    
+                    # Sleep with shutdown check
+                    for _ in range(int(delay)):
+                        if shutdown_flag.is_set():
+                            break
+                        time.sleep(1)
             
             print(f"{colored_text(f'✅ Account {self.account_index}: Share cycle completed! Posted {self.shares_posted} shares', Colors.GREEN)}")
             return shares_data
@@ -664,9 +677,13 @@ def cycle_based_share_like_automation(account_info_list, num_shares=5, share_del
         # Run infinite cycles until Ctrl+C
         cycle = 1
         try:
-            while True:  # Infinite loop until Ctrl+C
+            while not shutdown_flag.is_set():  # Check shutdown flag
                 print(f"\n{colored_text(f'🔥 STARTING CYCLE {cycle} (Press Ctrl+C to stop)', Colors.BOLD + Colors.MAGENTA)}")
                 print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
+                
+                # Check shutdown before each phase
+                if shutdown_flag.is_set():
+                    break
                 
                 # Phase 1: Share Phase for this cycle
                 print(f"\n{colored_text(f'📝 CYCLE {cycle} - PHASE 1: SHARING', Colors.BOLD + Colors.CYAN)}")
@@ -745,12 +762,17 @@ def cycle_based_share_like_automation(account_info_list, num_shares=5, share_del
                 print(f"\n{colored_text(f'⏳ Waiting {cycle_delay//60} minutes before CYCLE {cycle + 1}...', Colors.YELLOW)}")
                 print(f"{colored_text('💡 Press Ctrl+C anytime to stop automation', Colors.CYAN)}")
                 
-                # Countdown timer
+                # Countdown timer with shutdown check
                 for remaining in range(cycle_delay, 0, -60):
+                    if shutdown_flag.is_set():
+                        break
                     mins = remaining // 60
                     print(f"{colored_text(f'⏰ Next cycle in: {mins} minutes... (Ctrl+C to stop)', Colors.CYAN)}")
                     time.sleep(60)
                 
+                if shutdown_flag.is_set():
+                    break
+                    
                 cycle += 1  # Increment cycle counter
                 
         except KeyboardInterrupt:
@@ -817,6 +839,17 @@ def continuous_share_like_automation(account_info_list, cycles=5, cycle_delay=30
     except Exception as e:
         print(f"\n{colored_text(f'❌ Continuous automation error: {e}', Colors.RED)}")
 
+# Global flag for graceful shutdown
+shutdown_flag = threading.Event()
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C signal gracefully"""
+    print(f"\n{colored_text('⚠️  Received interrupt signal. Shutting down gracefully...', Colors.YELLOW)}")
+    shutdown_flag.set()
+    time.sleep(0.5)
+    print(f"{colored_text('🛑 Force shutdown initiated!', Colors.RED)}")
+    os._exit(0)
+
 def main():
     """Main function with advanced share + like automation"""
     # Clear screen for better presentation
@@ -881,15 +914,15 @@ def main():
         print(f"\n{colored_text('⚙️  SINGLE PROCESS CONFIGURATION', Colors.BOLD + Colors.MAGENTA)}")
         
         try:
-            num_shares = int(input(f"{colored_text('📝 Number of shares per account (1-10): ', Colors.CYAN)}") or "3")
-            num_shares = max(1, min(10, num_shares))
+            num_shares = int(input(f"{colored_text('📝 Number of shares per account: ', Colors.CYAN)}") or "3")
+            num_shares = max(1, num_shares)
             
-            share_delay_min = int(input(f"{colored_text('⏳ Min delay between shares (seconds, 5-60): ', Colors.CYAN)}") or "10")
-            share_delay_max = int(input(f"{colored_text('⏳ Max delay between shares (seconds, 5-60): ', Colors.CYAN)}") or "30")
-            share_delay_range = (max(5, share_delay_min), max(share_delay_min + 1, share_delay_max))
+            share_delay_min = int(input(f"{colored_text('⏳ Min delay between shares (seconds): ', Colors.CYAN)}") or "10")
+            share_delay_max = int(input(f"{colored_text('⏳ Max delay between shares (seconds): ', Colors.CYAN)}") or "30")
+            share_delay_range = (max(1, share_delay_min), max(share_delay_min + 1, share_delay_max))
             
-            like_delay_min = int(input(f"{colored_text('👍 Min delay between likes (seconds, 1-10): ', Colors.CYAN)}") or "2")
-            like_delay_max = int(input(f"{colored_text('👍 Max delay between likes (seconds, 1-10): ', Colors.CYAN)}") or "5")
+            like_delay_min = int(input(f"{colored_text('👍 Min delay between likes (seconds): ', Colors.CYAN)}") or "2")
+            like_delay_max = int(input(f"{colored_text('👍 Max delay between likes (seconds): ', Colors.CYAN)}") or "5")
             like_delay_range = (max(1, like_delay_min), max(like_delay_min + 1, like_delay_max))
             
         except ValueError:
@@ -914,19 +947,19 @@ def main():
         print(f"{colored_text('💡 Infinite cycles: Share → Like → Complete → Repeat (Ctrl+C to stop)', Colors.CYAN)}")
         
         try:
-            num_shares = int(input(f"{colored_text('📝 Shares per account per cycle (1-10): ', Colors.CYAN)}") or "3")
-            num_shares = max(1, min(10, num_shares))
+            num_shares = int(input(f"{colored_text('📝 Shares per account per cycle: ', Colors.CYAN)}") or "3")
+            num_shares = max(1, num_shares)
             
-            share_delay_min = int(input(f"{colored_text('⏳ Min delay between shares (seconds, 5-60): ', Colors.CYAN)}") or "10")
-            share_delay_max = int(input(f"{colored_text('⏳ Max delay between shares (seconds, 5-60): ', Colors.CYAN)}") or "30")
-            share_delay_range = (max(5, share_delay_min), max(share_delay_min + 1, share_delay_max))
+            share_delay_min = int(input(f"{colored_text('⏳ Min delay between shares (seconds): ', Colors.CYAN)}") or "10")
+            share_delay_max = int(input(f"{colored_text('⏳ Max delay between shares (seconds): ', Colors.CYAN)}") or "30")
+            share_delay_range = (max(1, share_delay_min), max(share_delay_min + 1, share_delay_max))
             
-            like_delay_min = int(input(f"{colored_text('👍 Min delay between likes (seconds, 1-10): ', Colors.CYAN)}") or "2")
-            like_delay_max = int(input(f"{colored_text('👍 Max delay between likes (seconds, 1-10): ', Colors.CYAN)}") or "5")
+            like_delay_min = int(input(f"{colored_text('👍 Min delay between likes (seconds): ', Colors.CYAN)}") or "2")
+            like_delay_max = int(input(f"{colored_text('👍 Max delay between likes (seconds): ', Colors.CYAN)}") or "5")
             like_delay_range = (max(1, like_delay_min), max(like_delay_min + 1, like_delay_max))
             
-            cycle_delay_mins = int(input(f"{colored_text('⏰ Delay between cycles (minutes, 5-60): ', Colors.CYAN)}") or "15")
-            cycle_delay = max(300, min(3600, cycle_delay_mins * 60))
+            cycle_delay_mins = int(input(f"{colored_text('⏰ Delay between cycles (minutes): ', Colors.CYAN)}") or "15")
+            cycle_delay = max(60, cycle_delay_mins * 60)
             
         except ValueError:
             print(f"{colored_text('⚠️  Invalid input, using defaults', Colors.YELLOW)}")
@@ -998,4 +1031,7 @@ def main():
         print(f"{colored_text('❌ Invalid choice! Please select 1-5.', Colors.RED)}")
 
 if __name__ == "__main__":
+    # Set up signal handlers
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
     main()

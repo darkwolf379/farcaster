@@ -9,13 +9,20 @@ import json
 import time
 import random
 import datetime
-import pytz
+import signal
+import sys
 import os
+import pytz
 import uuid
 import threading
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import unquote, quote
+
+# Global configuration variables
+global_team_preference = "auto"
+global_fuel_strategy = "max"
+global_min_fuel_threshold = 1
 
 # Color codes for terminal styling
 class Colors:
@@ -680,19 +687,19 @@ class FarcasterAutoVote:
             for i, mech in enumerate(mech_details):
                 team_indicator = ""
                 
-                # CORRECTED MAPPING berdasarkan info user:
-                # Biru = Kanan (index 1), Merah = Kiri (index 0)
+                # CORRECTED MAPPING:
+                # Blue = Index 0 (Team pertama), Red = Index 1 (Team kedua)
                 if i == 0:
-                    team_indicator = "red"   # Index 0 = Kiri = Merah
+                    team_indicator = "blue"   # Index 0 = Blue Team
                 elif i == 1:
-                    team_indicator = "blue"  # Index 1 = Kanan = Biru
+                    team_indicator = "red"    # Index 1 = Red Team
                 
                 # Cek berdasarkan field mechType jika ada
                 if 'mechType' in mech:
                     if mech['mechType'] == 'left':
-                        team_indicator = "red"   # Left = Merah
+                        team_indicator = "blue"   # Left = Blue Team
                     elif mech['mechType'] == 'right':
-                        team_indicator = "blue"  # Right = Biru
+                        team_indicator = "red"    # Right = Red Team
                 
                 # Match dengan preferensi user (CORRECTED)
                 if (self.team_preference in ['blue', 'biru', 'kanan', 'right'] and team_indicator == "blue") or \
@@ -807,14 +814,16 @@ class FarcasterAutoVote:
             # Tentukan jumlah fuel berdasarkan setting
             if not fuel_points:
                 if self.fuel_amount:
-                    # Cek apakah fuel amount tidak melebihi max fuel
-                    if self.fuel_amount > self.max_fuel:
-                        print(f"⚠️  Fuel amount ({self.fuel_amount}) melebihi max fuel ({self.max_fuel})")
-                        fuel_points = self.max_fuel
-                    else:
-                        fuel_points = self.fuel_amount
+                    # Cek apakah fuel amount tidak melebihi max fuel dan available fuel
+                    max_usable = min(self.fuel_amount, self.max_fuel, current_fuel)
+                    fuel_points = max_usable
                 else:
-                    fuel_points = 1  # Default 1 fuel
+                    # Max strategy - gunakan semua fuel yang tersedia
+                    fuel_points = min(current_fuel, self.max_fuel)
+                
+                print(f"🎯 Fuel strategy: {'Custom/Conservative' if self.fuel_amount else 'Max Available'}")
+                print(f"💰 Current fuel: {current_fuel}, Max fuel: {self.max_fuel}")
+                print(f"⛽ Will use: {fuel_points} fuel points")
             
             # Cek apakah fuel cukup setelah auto claim
             if current_fuel < fuel_points:
@@ -989,7 +998,7 @@ def process_single_account_vote(account_info, team_preference, fuel_strategy, cu
         print(f"❌ [Thread-{account_info['index']}] Error in account {account_info['index']}: {e}")
         return error_result
 
-def run_account_continuous_thread(account_info, thread_id, delay_config=None):
+def run_account_continuous_thread(account_info, thread_id, delay_config=None, team_preference="auto", fuel_strategy="max", min_fuel_threshold=1):
     """Run continuous voting untuk satu akun dalam thread terpisah dengan enhanced match detection"""
     try:
         account = account_info[thread_id]
@@ -1013,8 +1022,15 @@ def run_account_continuous_thread(account_info, thread_id, delay_config=None):
         print(f"\n🧵 [Thread-{thread_id+1}] Starting continuous voting for Account {account['index']} (FID: {fid})")
         print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Delay config: {format_duration(min_delay)} - {format_duration(max_delay)} (for continuous mode)', Colors.MAGENTA)}")
         
-        # Initialize bot untuk account ini
-        bot = FarcasterAutoVote(token, 1, 10, None)
+        # Initialize bot untuk account ini dengan konfigurasi global
+        # Team preference conversion: "auto" -> None for FarcasterAutoVote
+        bot_team_pref = None if team_preference == "auto" else team_preference
+        
+        # Create bot dengan fuel_amount = None untuk max strategy (akan detect real-time)
+        bot = FarcasterAutoVote(token, None, 10, bot_team_pref)
+        
+        print(f"🎯 [Thread-{thread_id+1}] Fuel strategy: {fuel_strategy}")
+        print(f"⛽ [Thread-{thread_id+1}] Min fuel threshold: {min_fuel_threshold}")
         
         account_cycle_count = 0  # INDEPENDENT cycle counter per account
         last_match_id = None  # Track match ID untuk deteksi match baru
@@ -1024,6 +1040,38 @@ def run_account_continuous_thread(account_info, thread_id, delay_config=None):
         while True:  # Continuous loop untuk account ini
             try:
                 account_cycle_count += 1  # Independent counter
+                
+                # Real-time fuel detection untuk setiap voting cycle
+                current_account_fuel = bot.get_user_fuel_info()
+                print(f"\n💰 [Account-{account['index']}] Current fuel: {current_account_fuel}")
+                
+                # Determine fuel amount per cycle berdasarkan strategy dan fuel aktual
+                if fuel_strategy == "conservative":
+                    if current_account_fuel >= min_fuel_threshold:
+                        vote_fuel_amount = min_fuel_threshold
+                    else:
+                        print(f"⚠️ [Account-{account['index']}] Insufficient fuel for conservative strategy (need {min_fuel_threshold}, have {current_account_fuel})")
+                        time.sleep(300)  # Wait 5 minutes and check again
+                        continue
+                elif fuel_strategy == "custom":
+                    if current_account_fuel >= min_fuel_threshold:
+                        vote_fuel_amount = min_fuel_threshold
+                    else:
+                        print(f"⚠️ [Account-{account['index']}] Insufficient fuel for custom strategy (need {min_fuel_threshold}, have {current_account_fuel})")
+                        time.sleep(300)  # Wait 5 minutes and check again
+                        continue
+                else:  # max strategy
+                    if current_account_fuel >= min_fuel_threshold:
+                        vote_fuel_amount = current_account_fuel  # Use ALL available fuel
+                        print(f"🚀 [Account-{account['index']}] Max strategy: Will use ALL {vote_fuel_amount} fuel!")
+                    else:
+                        print(f"⚠️ [Account-{account['index']}] Insufficient fuel for max strategy (need min {min_fuel_threshold}, have {current_account_fuel})")
+                        time.sleep(300)  # Wait 5 minutes and check again
+                        continue
+                
+                # Update bot dengan fuel amount yang benar untuk cycle ini
+                bot.fuel_amount = vote_fuel_amount
+                
                 print(f"\n{colored_text('╔' + '═' * 68 + '╗', Colors.MAGENTA)}")
                 thread_text = f"🔄 [Account-{account['index']}] Personal Cycle #{account_cycle_count} (FID: {fid})"
                 print(f"{colored_text('║', Colors.MAGENTA)} {colored_text(thread_text, Colors.BOLD + Colors.WHITE):>60} {colored_text('║', Colors.MAGENTA)}")
@@ -1191,10 +1239,16 @@ def run_account_continuous_thread(account_info, thread_id, delay_config=None):
     except KeyboardInterrupt:
         account_index = account.get('index', 'Unknown')
         print(f"\n{colored_text(f'⛔ [Account-{account_index}] Personal thread stopped by user after {account_cycle_count} cycles', Colors.BOLD + Colors.RED)}")
+        # Force exit thread
+        import os
+        os._exit(0)
     except Exception as e:
         print(f"\n{colored_text(f'❌ [Account-{account['index']}] Personal thread error: {e}', Colors.RED)}")
+        # Force exit thread on critical error
+        import os
+        os._exit(1)
 
-def threaded_continuous_multi_account_vote(active_accounts, delay_config=None):
+def threaded_continuous_multi_account_vote(active_accounts, delay_config=None, team_preference="auto", fuel_strategy="max", min_fuel_threshold=1):
     """Run multi-account voting dengan threading - setiap akun punya continuous loop sendiri"""
     import threading
     
@@ -1215,8 +1269,8 @@ def threaded_continuous_multi_account_vote(active_accounts, delay_config=None):
         for i, account in enumerate(active_accounts):
             thread = threading.Thread(
                 target=run_account_continuous_thread,
-                args=(active_accounts, i, delay_config),
-                daemon=True,
+                args=(active_accounts, i, delay_config, team_preference, fuel_strategy, min_fuel_threshold),
+                daemon=False,  # Changed to False agar bisa di-interrupt
                 name=f"Account-{account['index']}-Thread"
             )
             threads.append(thread)
@@ -1228,15 +1282,27 @@ def threaded_continuous_multi_account_vote(active_accounts, delay_config=None):
         print("🔄 Threads are running continuously...")
         print("⛔ Press Ctrl+C to stop all threads")
         
-        # Wait for all threads
-        for thread in threads:
-            thread.join()
+        # Wait for all threads dengan interrupt handling
+        try:
+            while any(thread.is_alive() for thread in threads):
+                time.sleep(0.5)  # Check every 0.5 seconds
+        except KeyboardInterrupt:
+            print(f"\n\n⛔ Ctrl+C detected! Stopping all threads...")
+            # Force terminate semua threads
+            import os
+            import signal
+            os.kill(os.getpid(), signal.SIGTERM)
             
     except KeyboardInterrupt:
         print(f"\n\n⛔ Threaded multi-account voting stopped by user")
         print("👋 All threads will be terminated...")
+        # Force exit
+        import os
+        os._exit(0)
     except Exception as e:
         print(f"\n❌ Threading error: {e}")
+        import os
+        os._exit(1)
 
 def threaded_multi_account_vote(account_info_list, use_threading=False, delay_config=None):
     """Multi-account voting dengan opsi threading"""
@@ -1263,51 +1329,9 @@ def threaded_multi_account_vote(account_info_list, use_threading=False, delay_co
     # Use active accounts for processing
     account_info_list = active_accounts
     
-    # Get team preference
-    print("\n🎯 PILIH PREFERENSI TIM:")
-    print("1. Blue Team (Biru/Kanan)")
-    print("2. Red Team (Merah/Kiri)")  
-    print("3. Auto (Based on winning probability)")
-    
-    team_choice = input("Pilih tim (1/2/3): ").strip()
-    team_preference = None
-    if team_choice == "1":
-        team_preference = "blue"
-    elif team_choice == "2":
-        team_preference = "red"
-    elif team_choice == "3":
-        team_preference = None
-    else:
-        print("⚠️  Invalid choice, using Auto")
-        team_preference = None
-    
-    # Get fuel strategy
-    print(f"\n⛽ PILIH STRATEGI FUEL:")
-    print("1. Conservative (1 fuel)")
-    print("2. Max Available Fuel")
-    print("3. Custom Amount")
-    
-    fuel_choice = input("Pilih strategi fuel (1/2/3): ").strip()
-    fuel_strategy = "max"
-    custom_fuel = None
-    
-    if fuel_choice == "1":
-        fuel_strategy = "conservative"
-        custom_fuel = 1
-    elif fuel_choice == "2":
-        fuel_strategy = "max"
-    elif fuel_choice == "3":
-        fuel_strategy = "custom"
-        try:
-            custom_fuel = int(input("Masukkan jumlah fuel (1-10): "))
-            if custom_fuel < 1 or custom_fuel > 10:
-                print("⚠️  Invalid fuel amount, using 1")
-                custom_fuel = 1
-        except ValueError:
-            print("⚠️  Invalid input, using 1 fuel")
-            custom_fuel = 1
-    else:
-        print("⚠️  Invalid choice, using Max Fuel")
+    # Use global configuration instead of asking user
+    print(f"\n{colored_text('🎯 Using global team preference:', Colors.YELLOW)} {colored_text(global_team_preference.title(), Colors.CYAN)}")
+    print(f"{colored_text('⛽ Using global fuel strategy:', Colors.YELLOW)} {colored_text(global_fuel_strategy.title(), Colors.CYAN)} (min: {global_min_fuel_threshold})")
     
     vote_cycle = 0
     
@@ -1325,14 +1349,15 @@ def threaded_multi_account_vote(account_info_list, use_threading=False, delay_co
             if use_threading:
                 # Threading approach
                 print(f"\n{colored_text('┌─ Threading Info ─' + '─' * 48 + '┐', Colors.MAGENTA)}")
-                print(f"{colored_text('│', Colors.MAGENTA)} {colored_text(f'🧵 Using threaded execution for {len(account_info_list)} accounts...', Colors.WHITE):<60} {colored_text('│', Colors.MAGENTA)}")
+                threading_msg = f'🧵 Using threaded execution for {len(account_info_list)} accounts...'
+                print(f"{colored_text('│', Colors.MAGENTA)} {colored_text(threading_msg, Colors.WHITE):<60} {colored_text('│', Colors.MAGENTA)}")
                 print(f"{colored_text('└' + '─' * 68 + '┘', Colors.MAGENTA)}")
                 results_queue = queue.Queue()
                 
                 with ThreadPoolExecutor(max_workers=len(account_info_list)) as executor:
                     # Submit all tasks
                     future_to_account = {
-                        executor.submit(process_single_account_vote, acc_info, team_preference, fuel_strategy, custom_fuel, results_queue): acc_info
+                        executor.submit(process_single_account_vote, acc_info, global_team_preference, global_fuel_strategy, global_min_fuel_threshold, results_queue): acc_info
                         for acc_info in account_info_list
                     }
                     
@@ -1359,7 +1384,7 @@ def threaded_multi_account_vote(account_info_list, use_threading=False, delay_co
                 results_queue = queue.Queue()
                 
                 for acc_info in account_info_list:
-                    result = process_single_account_vote(acc_info, team_preference, fuel_strategy, custom_fuel, results_queue)
+                    result = process_single_account_vote(acc_info, global_team_preference, global_fuel_strategy, global_min_fuel_threshold, results_queue)
                     all_results.append(result)
             
                 # Summary results
@@ -1448,7 +1473,7 @@ def threaded_multi_account_vote(account_info_list, use_threading=False, delay_co
         print(f"\n❌ Unexpected error in {'threaded' if use_threading else 'sequential'} vote: {e}")
         print(f"📊 Total vote cycles: {vote_cycle}")
 
-def continuous_multi_account_vote(account_info, delay_config=None):
+def continuous_multi_account_vote(account_info, delay_config=None, team_preference="auto", fuel_strategy="max", min_fuel_threshold=1):
     """Continuous auto vote untuk multi account dengan match timing"""
     print("\n🔄 CONTINUOUS MULTI-ACCOUNT AUTO VOTE MODE")
     print("=" * 60)
@@ -1478,43 +1503,13 @@ def continuous_multi_account_vote(account_info, delay_config=None):
     for acc in active_accounts:
         print(f"   • Account {acc['index']} (FID: {acc['fid']}): {acc['fuel']} fuel")
     
-    # Configuration
-    print("\n⚙️  TEAM CONFIGURATION:")
-    print("1. Blue (Kanan)")
-    print("2. Red (Kiri)")
-    print("3. Auto (Random/Best Choice)")
-    
-    team_choice_num = input("\nPilih team untuk semua account (1/2/3): ").strip()
-    if team_choice_num == "1":
-        team_preference = "blue"
-    elif team_choice_num == "2":
-        team_preference = "red"
-    else:
-        team_preference = None
-    
-    print(f"\n⛽ FUEL CONFIGURATION:")
-    print("1. Use 1 fuel per vote (Conservative)")
-    print("2. Use max fuel available per account")
-    print("3. Custom fuel amount")
-    
-    fuel_choice = input("\nPilih strategi fuel (1/2/3): ").strip()
-    
-    if fuel_choice == "1":
-        fuel_strategy = "conservative"
-        fuel_amount = 1
-    elif fuel_choice == "2":
-        fuel_strategy = "max"
-        fuel_amount = None  # Will use max available
-    else:
-        fuel_strategy = "custom"
-        try:
-            fuel_amount = int(input("Masukkan jumlah fuel per vote: ") or "1")
-        except ValueError:
-            fuel_amount = 1
+    # Use global configuration instead of asking user
+    print(f"\n{colored_text('🎯 Using global team preference:', Colors.YELLOW)} {colored_text(team_preference.title(), Colors.CYAN)}")
+    print(f"{colored_text('⛽ Using global fuel strategy:', Colors.YELLOW)} {colored_text(fuel_strategy.title(), Colors.CYAN)} (min: {min_fuel_threshold})")
     
     print(f"\n✅ CONFIGURATION SUMMARY:")
-    print(f"🎨 Team preference: {team_preference or 'Auto'}")
-    print(f"⛽ Fuel strategy: {fuel_strategy} ({'1 fuel' if fuel_strategy == 'conservative' else 'max available' if fuel_strategy == 'max' else f'{fuel_amount} fuel'})")
+    print(f"🎨 Team preference: {global_team_preference or 'Auto'}")
+    print(f"⛽ Fuel strategy: {global_fuel_strategy} (min threshold: {global_min_fuel_threshold})")
     print(f"👥 Active accounts: {len(active_accounts)}")
     
     confirm = input("\nStart continuous voting? (y/n): ").strip().lower()
@@ -1641,15 +1636,17 @@ def continuous_multi_account_vote(account_info, delay_config=None):
                     acc['fuel'] = current_fuel
                     print(f"{colored_text(f'⛽ Current fuel: {current_fuel}', Colors.GREEN)}")
                     
-                    # Determine fuel to use
+                    # Determine fuel to use based on global strategy
                     if fuel_strategy == "conservative":
-                        fuel_to_use = 1
+                        fuel_to_use = min_fuel_threshold
                     elif fuel_strategy == "max":
                         fuel_to_use = current_fuel
-                    else:  # custom
-                        fuel_to_use = min(fuel_amount, current_fuel)
+                    elif fuel_strategy == "custom":
+                        fuel_to_use = min(min_fuel_threshold, current_fuel)
+                    else:
+                        fuel_to_use = current_fuel  # Default to max
                     
-                    print(f"{colored_text(f'🎯 Using {fuel_to_use} fuel for this vote', Colors.YELLOW)}")
+                    print(f"{colored_text(f'🎯 Using {fuel_to_use} fuel for this vote (strategy: {fuel_strategy})', Colors.YELLOW)}")
                     
                     # TAMBAHAN: Random delay sebelum vote (hanya jika ada delay)
                     delay_time = account_delays[acc_index]
@@ -1668,8 +1665,9 @@ def continuous_multi_account_vote(account_info, delay_config=None):
                     else:
                         print(f"{colored_text(f'🎯 Account {acc_index}: No delay - voting immediately!', Colors.GREEN)}")
                     
-                    # Attempt vote
-                    bot = FarcasterAutoVote(acc['token'], fuel_to_use, current_fuel, team_preference)
+                    # Attempt vote with global team preference
+                    bot_team_pref = None if team_preference == "auto" else team_preference
+                    bot = FarcasterAutoVote(acc['token'], fuel_to_use, current_fuel, bot_team_pref)
                     success = bot.run_auto_vote()
                     
                     if success:
@@ -1753,6 +1751,29 @@ def continuous_multi_account_vote(account_info, delay_config=None):
         print(f"\n❌ Unexpected error in continuous vote: {e}")
         print(f"📊 Total vote cycles: {vote_cycle}")
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C signal untuk force exit"""
+    print(f"\n\n{colored_text('⛔ CTRL+C DETECTED! FORCE STOPPING ALL PROCESSES...', Colors.BOLD + Colors.RED)}")
+    print(f"{colored_text('👋 Exiting immediately...', Colors.YELLOW)}")
+    
+    # Force terminate semua threads dan processes
+    try:
+        import threading
+        # Set all threads as daemon so they die with main process
+        for thread in threading.enumerate():
+            if thread != threading.current_thread():
+                thread.daemon = True
+    except:
+        pass
+    
+    # Force exit
+    os._exit(0)
+
+def main():
+    """Main function with multi account support"""
+    # Setup signal handler untuk Ctrl+C
+    signal.signal(signal.SIGINT, signal_handler)
+    
 def main():
     """Main function with multi account support"""
     # Clear screen for better presentation
@@ -1881,12 +1902,79 @@ def main():
         return
     
     # Option 1: Auto Vote All Accounts (Continuous Loop)
-    # Ask for threading preference
-    print(f"\n🧵 PILIH MODE EXECUTION:")
-    print("Sequential: Accounts akan vote satu per satu (lebih stabil)")
-    print("Threaded: Semua accounts vote bersamaan (lebih cepat)")
     
-    use_threading_input = input("\nUse multi-threading? (y/n): ").strip().lower()
+    # TEAM PREFERENCE CONFIGURATION
+    print(f"\n{colored_text('═' * 70, Colors.MAGENTA)}")
+    print(f"{colored_text('🎯 TEAM PREFERENCE CONFIGURATION', Colors.BOLD + Colors.MAGENTA)}")
+    print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
+    
+    team_menu_lines = [
+        "┌─────────────────────────────────────────────────────────────────┐",
+        "│  1. 🔵 Blue Team (Always vote for Blue Team)                   │",
+        "│  2. 🔴 Red Team (Always vote for Red Team)                     │", 
+        "│  3. 🎲 Auto (Random team selection for each vote)              │",
+        "└─────────────────────────────────────────────────────────────────┘"
+    ]
+    
+    for line in team_menu_lines:
+        print(colored_text(line, Colors.BLUE))
+    
+    team_choice = input(f"\n{colored_text('🎯 Select team preference (1/2/3):', Colors.BOLD + Colors.YELLOW)} ").strip()
+    
+    if team_choice == "1":
+        global_team_preference = "blue"
+        print(f"{colored_text('✅ Team preference set to: Blue Team', Colors.BLUE)}")
+    elif team_choice == "2":
+        global_team_preference = "red"
+        print(f"{colored_text('✅ Team preference set to: Red Team', Colors.RED)}")
+    else:
+        global_team_preference = "auto"
+        print(f"{colored_text('✅ Team preference set to: Auto (Random)', Colors.YELLOW)}")
+    
+    # FUEL STRATEGY CONFIGURATION
+    print(f"\n{colored_text('═' * 70, Colors.MAGENTA)}")
+    print(f"{colored_text('⛽ FUEL STRATEGY CONFIGURATION', Colors.BOLD + Colors.MAGENTA)}")
+    print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
+    
+    fuel_menu_lines = [
+        "┌─────────────────────────────────────────────────────────────────┐",
+        "│  1. 🛡️  Conservative (Use only when fuel > 3)                  │",
+        "│  2. 🚀 Max Available (Use all available fuel)                  │",
+        "│  3. ⚙️  Custom (Set minimum fuel threshold)                    │",
+        "└─────────────────────────────────────────────────────────────────┘"
+    ]
+    
+    for line in fuel_menu_lines:
+        print(colored_text(line, Colors.BLUE))
+    
+    fuel_choice = input(f"\n{colored_text('⛽ Select fuel strategy (1/2/3):', Colors.BOLD + Colors.YELLOW)} ").strip()
+    
+    if fuel_choice == "1":
+        global_fuel_strategy = "conservative"
+        global_min_fuel_threshold = 3
+        print(f"{colored_text('✅ Fuel strategy set to: Conservative (min fuel: 3)', Colors.GREEN)}")
+    elif fuel_choice == "3":
+        global_fuel_strategy = "custom"
+        try:
+            global_min_fuel_threshold = int(input("Enter minimum fuel threshold: ") or "1")
+            if global_min_fuel_threshold < 1:
+                global_min_fuel_threshold = 1
+        except ValueError:
+            global_min_fuel_threshold = 1
+        print(f"{colored_text(f'✅ Fuel strategy set to: Custom (min fuel: {global_min_fuel_threshold})', Colors.GREEN)}")
+    else:
+        global_fuel_strategy = "max"
+        global_min_fuel_threshold = 1
+        print(f"{colored_text('✅ Fuel strategy set to: Max Available (min fuel: 1)', Colors.GREEN)}")
+    
+    # Ask for threading preference
+    print(f"\n{colored_text('═' * 70, Colors.MAGENTA)}")
+    print(f"{colored_text('🧵 EXECUTION MODE CONFIGURATION', Colors.BOLD + Colors.MAGENTA)}")
+    print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
+    print("🔄 Sequential: Accounts akan vote satu per satu (lebih stabil)")
+    print("🧵 Threaded: Semua accounts vote bersamaan (lebih cepat)")
+    
+    use_threading_input = input(f"\n{colored_text('🧵 Use multi-threading? (y/n):', Colors.BOLD + Colors.YELLOW)} ").strip().lower()
     use_threading = use_threading_input in ['y', 'yes', '1', 'true']
     
     # Custom delay configuration
@@ -1958,20 +2046,42 @@ def main():
     # Pass delay configuration to voting functions
     delay_config = {'min_delay': min_delay, 'max_delay': max_delay}
     
+    # Show final configuration summary
+    print(f"\n{colored_text('═' * 70, Colors.MAGENTA)}")
+    print(f"{colored_text('📋 FINAL CONFIGURATION SUMMARY', Colors.BOLD + Colors.MAGENTA)}")
+    print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
+    print(f"{colored_text('🎯 Team Preference:', Colors.YELLOW)} {colored_text(global_team_preference.title(), Colors.CYAN)}")
+    print(f"{colored_text('⛽ Fuel Strategy:', Colors.YELLOW)} {colored_text(global_fuel_strategy.title(), Colors.CYAN)} (min: {global_min_fuel_threshold})")
+    print(f"{colored_text('🎲 Delay Range:', Colors.YELLOW)} {colored_text(f'{format_duration(min_delay)} - {format_duration(max_delay)}', Colors.CYAN)}")
+    print(f"{colored_text('🧵 Execution Mode:', Colors.YELLOW)} {colored_text('Threading' if use_threading else 'Sequential', Colors.CYAN)}")
+    print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
+    
     if use_threading:
-        print("🧵 Using threaded execution mode...")
-        print("🎯 Each account will have independent continuous cycles...")
+        print(f"{colored_text('🧵 Using threaded execution mode...', Colors.GREEN)}")
+        print(f"{colored_text('🎯 Each account will have independent continuous cycles...', Colors.GREEN)}")
         
         # Filter active accounts untuk threading
-        active_accounts = [acc for acc in account_info if acc['fuel'] > 0]
+        active_accounts = [acc for acc in account_info if acc['fuel'] >= global_min_fuel_threshold]
         if not active_accounts:
-            print("❌ No accounts with fuel available!")
+            print(f"{colored_text('❌ No accounts meet the fuel threshold!', Colors.RED)}")
             return
             
-        threaded_continuous_multi_account_vote(active_accounts, delay_config=delay_config)
+        threaded_continuous_multi_account_vote(
+            active_accounts, 
+            delay_config=delay_config,
+            team_preference=global_team_preference,
+            fuel_strategy=global_fuel_strategy,
+            min_fuel_threshold=global_min_fuel_threshold
+        )
     else:
-        print("🔄 Using sequential execution mode...")
-        continuous_multi_account_vote(account_info, delay_config=delay_config)
+        print(f"{colored_text('🔄 Using sequential execution mode...', Colors.GREEN)}")
+        continuous_multi_account_vote(
+            account_info, 
+            delay_config=delay_config,
+            team_preference=global_team_preference,
+            fuel_strategy=global_fuel_strategy,
+            min_fuel_threshold=global_min_fuel_threshold
+        )
 
 if __name__ == "__main__":
     main()
