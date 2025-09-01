@@ -305,12 +305,19 @@ class FarcasterAutoShareLike:
             
             response = requests.put(url, headers=headers, json=payload, timeout=10)
             
+            print(f"{colored_text(f'🔍 Like response: Status {response.status_code}', Colors.WHITE)}")
+            
             if response.status_code in [200, 201]:
                 self.likes_given += 1
                 print(f"{colored_text(f'✅ Account {self.account_index}: Like given successfully! Total: {self.likes_given}', Colors.GREEN)}")
                 return True
             else:
-                print(f"{colored_text(f'❌ Account {self.account_index}: Like failed (Status: {response.status_code})', Colors.RED)}")
+                try:
+                    error_data = response.json()
+                    print(f"{colored_text(f'❌ Account {self.account_index}: Like failed (Status: {response.status_code})', Colors.RED)}")
+                    print(f"{colored_text(f'   Error details: {error_data}', Colors.RED)}")
+                except:
+                    print(f"{colored_text(f'❌ Account {self.account_index}: Like failed (Status: {response.status_code}) - No JSON response', Colors.RED)}")
                 return False
                 
         except Exception as e:
@@ -322,16 +329,24 @@ class FarcasterAutoShareLike:
         try:
             liked_count = 0
             
-            for share_data in all_shares_data:
+            print(f"{colored_text(f'🔍 Account {self.account_index}: Starting to like shares from others...', Colors.CYAN)}")
+            print(f"{colored_text(f'   📊 Total shares to process: {len(all_shares_data)}', Colors.WHITE)}")
+            
+            for i, share_data in enumerate(all_shares_data):
+                print(f"{colored_text(f'   🔄 Processing share {i+1}/{len(all_shares_data)}...', Colors.CYAN)}")
+                
                 # Skip own shares
                 if share_data.get('account_index') == self.account_index:
+                    print(f"{colored_text(f'   ⏭️  Skipping own share (Account {self.account_index})', Colors.YELLOW)}")
                     continue
                     
                 if not share_data.get('success'):
+                    print(f"{colored_text(f'   ⏭️  Skipping failed share from Account {share_data.get('account_index')}', Colors.YELLOW)}")
                     continue
                     
                 cast_hash = share_data.get('cast_hash')
                 if not cast_hash:
+                    print(f"{colored_text(f'   ❌ No cast hash found for share from Account {share_data.get('account_index')}', Colors.RED)}")
                     continue
                 
                 target_info = {
@@ -339,16 +354,21 @@ class FarcasterAutoShareLike:
                     'account_index': share_data.get('account_index', 'Unknown')
                 }
                 
+                print(f"{colored_text(f'   👍 Attempting to like cast from Account {target_info['account_index']} (@{target_info['username']})', Colors.CYAN)}")
+                print(f"{colored_text(f'   🆔 Cast hash: {cast_hash[:10]}...', Colors.WHITE)}")
+                
                 # Like the cast
                 if self.like_cast(cast_hash, target_info):
                     liked_count += 1
                     self.shares_liked += 1
+                    print(f"{colored_text(f'   ✅ Like successful! Total likes given: {liked_count}', Colors.GREEN)}")
                     
                     # Random delay between likes
                     delay = random.uniform(delay_range[0], delay_range[1])
-                    print(f"{colored_text(f'⏳ Account {self.account_index}: Waiting {delay:.1f}s before next like...', Colors.CYAN)}")
+                    print(f"{colored_text(f'   ⏳ Waiting {delay:.1f}s before next like...', Colors.CYAN)}")
                     time.sleep(delay)
                 else:
+                    print(f"{colored_text(f'   ❌ Like failed for cast from Account {target_info['account_index']}', Colors.RED)}")
                     # Small delay even on failure
                     time.sleep(1)
             
@@ -717,13 +737,23 @@ def cycle_based_share_like_automation(account_info_list, num_shares=5, share_del
                 print(f"\n{colored_text(f'📊 CYCLE {cycle} - PHASE 1 SUMMARY', Colors.BOLD + Colors.CYAN)}")
                 print(f"{colored_text(f'✅ Shares posted: {successful_shares}/{len(cycle_shares_data)}', Colors.GREEN)}")
                 
+                # Debug: Show all share data
+                print(f"\n{colored_text('🔍 DEBUG: Share data collected:', Colors.YELLOW)}")
+                for i, share in enumerate(cycle_shares_data):
+                    if share.get('success'):
+                        print(f"  Share {i+1}: Account {share.get('account_index')}, Hash: {share.get('cast_hash')[:10]}..." if share.get('cast_hash') else f"  Share {i+1}: Account {share.get('account_index')}, Hash: Missing")
+                
                 if successful_shares == 0:
                     print(f"{colored_text(f'❌ No shares posted in cycle {cycle}! Continuing to next cycle.', Colors.RED)}")
                 else:
                     # Phase 2: Like Phase for this cycle's shares
                     print(f"\n{colored_text(f'👍 CYCLE {cycle} - PHASE 2: CROSS-LIKING', Colors.BOLD + Colors.YELLOW)}")
-                    print(f"{colored_text('⏳ Waiting 10 seconds for shares to be indexed...', Colors.CYAN)}")
-                    time.sleep(10)
+                    print(f"{colored_text('⏳ Waiting 30 seconds for shares to be indexed and available...', Colors.CYAN)}")
+                    
+                    # Longer wait for API indexing
+                    for i in range(30, 0, -5):
+                        print(f"{colored_text(f'⏰ Waiting {i} seconds...', Colors.CYAN)}")
+                        time.sleep(5)
                     
                     like_results_queue = queue.Queue()
                     

@@ -73,8 +73,29 @@ def print_simple_status(message, status="info"):
     }
     color = colors.get(status, Colors.WHITE)
     print(f"{colored_text(message, color)}")
-    
-    print(f"{colored_text('═' * 70, color)}")
+
+def print_account_header(account_index, fid, cycle_num):
+    """Print clean account header"""
+    print(f"\n{colored_text('═' * 60, Colors.CYAN)}")
+    print(f"{colored_text(f'🔄 Account-{account_index} | Cycle #{cycle_num} | FID: {fid}', Colors.BOLD + Colors.CYAN)}")
+    print(f"{colored_text('═' * 60, Colors.CYAN)}")
+
+def print_vote_success(account_index, match_id_short):
+    """Print clean vote success message"""
+    print(f"{colored_text(f'✅ Account-{account_index} voted successfully on {match_id_short}', Colors.GREEN)}")
+
+def print_wait_message(account_index, wait_time):
+    """Print clean wait message"""
+    print(f"{colored_text(f'⏳ Account-{account_index} waiting {wait_time} until next vote...', Colors.YELLOW)}")
+
+def interruptible_sleep(seconds):
+    """Sleep that can be interrupted by Ctrl+C more responsively"""
+    try:
+        end_time = time.time() + seconds
+        while time.time() < end_time:
+            time.sleep(0.1)  # Short sleep chunks
+    except KeyboardInterrupt:
+        raise KeyboardInterrupt("Sleep interrupted")
 
 def parse_iso_time(iso_string):
     """Parse ISO time string ke datetime object"""
@@ -178,7 +199,7 @@ def wait_for_next_match(bot_instance, max_wait_minutes=30):
             if not match_details or 'data' not in match_details or not match_details['data']['matchData']:
                 print(f"⚠️ No match data available, waiting 1 minute...")
                 time.sleep(60)
-                continue
+                return False
             
             current_match = match_details['data']['matchData'][0]
             match_id = current_match.get('_id', 'Unknown')
@@ -228,17 +249,26 @@ def wait_for_next_match(bot_instance, max_wait_minutes=30):
     return False, None
 
 class FarcasterAutoVote:
-    def __init__(self, authorization_token, fuel_amount=1, max_fuel=10, team_preference=None):
+    def __init__(self, authorization_token, fuel_amount=1, max_fuel=10, team_preference=None, lazy_init=False):
         self.authorization_token = authorization_token
         self.fuel_amount = fuel_amount
         self.max_fuel = max_fuel
         self.team_preference = team_preference
         self.user_id = None
         
-        # Auto-detect FID
-        self.user_id = self.detect_fid_from_token()
+        # Only auto-detect FID when not lazy initialization
+        if not lazy_init:
+            self.user_id = self.detect_fid_from_token()
+            if not self.user_id:
+                print("⚠️ Could not auto-detect FID")
+
+    def ensure_initialized(self):
+        """Ensure FID is detected when needed"""
         if not self.user_id:
-            print("⚠️ Could not auto-detect FID")
+            self.user_id = self.detect_fid_from_token()
+            if not self.user_id:
+                raise Exception("Could not detect FID from token")
+        return self.user_id
 
     def detect_fid_from_token(self):
         """Auto-detect FID dari authorization token"""
@@ -259,11 +289,10 @@ class FarcasterAutoVote:
                 username = user_data.get('username', 'Unknown')
                 
                 if fid:
-                    print(f"✅ Auto-detected FID: {fid} (@{username})")
                     return fid
                     
         except Exception as e:
-            print(f"❌ Error detecting FID: {e}")
+            pass
             
         return None
 
@@ -361,11 +390,19 @@ class FarcasterAutoVote:
             print(f"{colored_text(f'❌ Error registering user: {e}', Colors.RED)}")
             return False
 
-    def get_user_fuel_info(self, fid=None):
-        """Get accurate fuel info with comprehensive debugging"""
+    def get_user_fuel_info(self, fid=None, skip_claim=False):
+        """Get fuel info - cleaner version"""
         try:
-            fid = fid or self.user_id
-            print(f"{colored_text(f'🔍 Checking fuel for FID: {fid}', Colors.CYAN)}")
+            fid = fid or self.ensure_initialized()
+            
+            # Silent fuel claim
+            if not skip_claim:
+                try:
+                    claimed = self.claim_fuel_reward()
+                    if claimed > 0:
+                        time.sleep(2)  # Wait for balance update
+                except:
+                    pass
             
             url = f"https://versus-prod-api.wreckleague.xyz/v1/user/data?fId={fid}"
             headers = {
@@ -376,10 +413,8 @@ class FarcasterAutoVote:
             }
             
             response = requests.get(url, headers=headers, timeout=10)
-            print(f"{colored_text(f'📡 API Response Status: {response.status_code}', Colors.YELLOW)}")
             
             if response.status_code == 404:
-                print(f"{colored_text('❌ User not found, attempting registration...', Colors.RED)}")
                 if self.register_user_to_frame():
                     time.sleep(3)
                     response = requests.get(url, headers=headers, timeout=10)
@@ -388,104 +423,82 @@ class FarcasterAutoVote:
             
             if response.status_code == 200:
                 data = response.json()
-                print(f"{colored_text('� Raw API Response Structure:', Colors.CYAN)}")
-                print(f"{colored_text('  Response structure will be analyzed below...', Colors.WHITE)}")
-                
-                # Check for canClaimFuel
                 user_data = data.get('data', {}) if isinstance(data, dict) else {}
-                can_claim = user_data.get('canClaimFuel', False)
                 
-                if can_claim:
-                    print(f"{colored_text('🎁 Can claim fuel: YES - Auto claiming...', Colors.GREEN)}")
-                    if self.claim_fuel_reward():
-                        time.sleep(2)
-                        response = requests.get(url, headers=headers, timeout=10)
-                        if response.status_code == 200:
-                            data = response.json()
-                            print(f"{colored_text('✅ Data refreshed after fuel claim', Colors.GREEN)}")
-                else:
-                    print(f"{colored_text('🎁 Can claim fuel: NO', Colors.YELLOW)}")
+                # Get fuel balance
+                fuel_balance = 0
+                if 'fuelBalance' in user_data:
+                    fuel_balance = user_data.get('fuelBalance', 0)
                 
-                # Enhanced fuel path detection with better error handling
-                fuel_paths = [
-                    ['data', 'fuelBalance'],
-                    ['data', 'data', 'fuelBalance'],
-                    ['data', 'fuel'],
-                    ['data', 'data', 'fuel'],
-                    ['data', 'user', 'fuel'],
-                    ['fuel'],
-                    ['fuelBalance'],
-                    ['user', 'fuel'],
-                    ['data', 'user', 'fuelBalance']
-                ]
+                # Fallback checks
+                if fuel_balance == 0:
+                    if 'fuel' in user_data:
+                        fuel_balance = user_data.get('fuel', 0)
+                    elif 'balance' in user_data:
+                        fuel_balance = user_data.get('balance', 0)
                 
-                print(f"{colored_text('🔍 Checking fuel status...', Colors.CYAN)}")
-                
-                # Try fuel paths without verbose debugging
-                for path in fuel_paths:
-                    try:
-                        fuel_value = data
-                        for key in path:
-                            if isinstance(fuel_value, dict) and key in fuel_value:
-                                fuel_value = fuel_value[key]
-                            else:
-                                raise KeyError(f"Key '{key}' not found")
-                        
-                        if isinstance(fuel_value, (int, float)) and fuel_value >= 0:
-                            path_str = " -> ".join(path)
-                            print(f"{colored_text(f'✅ Found fuel: {fuel_value} (via {path_str})', Colors.GREEN)}")
-                            return int(fuel_value)
-                            
-                    except:
-                        continue
-                
-                # If no fuel found, return 0 quietly
-                print(f"{colored_text('❌ No fuel found in account', Colors.RED)}")
-                return 0
+                return fuel_balance
             else:
-                print(f"{colored_text(f'❌ API returned status {response.status_code}', Colors.RED)}")
-                print(f"{colored_text(f'Response: {response.text[:200]}', Colors.WHITE)}")
                 return 0
-            
+                
         except Exception as e:
-            print(f"{colored_text(f'❌ Critical error in fuel detection: {e}', Colors.RED)}")
             return 0
 
     def claim_fuel_reward(self):
-        """Claim fuel reward if available"""
+        """Claim fuel reward if available - silent version"""
         try:
-            print(f"{colored_text('⛽ Attempting to claim fuel reward...', Colors.YELLOW)}")
-            
-            # Get current user data to check rewards
             headers = {
                 'accept': '*/*',
-                'accept-language': 'en-US,en;q=0.9',
-                'authorization': f'Bearer {self.authorization_token}',
-                'content-type': 'application/json',
-                'origin': 'https://warpcast.com',
+                'accept-language': 'id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7',
+                'sec-ch-ua': '"Not-A.Brand";v="99", "Chromium";v="124"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Linux"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-site',
                 'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-            }
+            }            # Check for available rewards
+            check_url = f"https://versus-prod-api.wreckleague.xyz/v1/user/fuelReward?fId={self.user_id}"
+            check_response = requests.get(check_url, headers=headers, timeout=10)
             
-            # Claim fuel reward
-            payload = {"fid": self.user_id}
-            response = requests.post(
-                "https://versus-prod-api.wreckleague.xyz/v1/user/claim-fuel", 
-                headers=headers, 
-                json=payload, 
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                result = response.json()
-                print(f"{colored_text('✅ Fuel reward claimed successfully!', Colors.GREEN)}")
-                return True
-            else:
-                print(f"{colored_text(f'❌ Failed to claim fuel reward: {response.status_code}', Colors.RED)}")
-                return False
+            if check_response.status_code == 200:
+                reward_data = check_response.json()
+                claimable_amount = 0
                 
+                # Check untuk claimable fuel
+                if isinstance(reward_data, dict):
+                    if 'claimableFuel' in reward_data:
+                        claimable_amount = reward_data.get('claimableFuel', 0)
+                    elif 'fuel' in reward_data and reward_data.get('fuel', 0) > 0:
+                        claimable_amount = reward_data.get('fuel', 0)
+                    elif 'fuelsToClaim' in reward_data:
+                        claimable_amount = reward_data.get('fuelsToClaim', 0)
+                    
+                    # Check nested data
+                    elif 'data' in reward_data:
+                        nested_data = reward_data['data']
+                        if isinstance(nested_data, dict):
+                            if 'claimableFuel' in nested_data:
+                                claimable_amount = nested_data.get('claimableFuel', 0)
+                            elif 'fuelsToClaim' in nested_data:
+                                claimable_amount = nested_data.get('fuelsToClaim', 0)
+                            elif 'fuelsData' in nested_data:
+                                fuels_data = nested_data['fuelsData']
+                                if isinstance(fuels_data, dict) and 'fuelsToClaim' in fuels_data:
+                                    claimable_amount = fuels_data.get('fuelsToClaim', 0)
+                
+                if claimable_amount > 0:
+                    # Try to claim
+                    claim_url = f"https://versus-prod-api.wreckleague.xyz/v1/user/fuelReward?fId={self.user_id}"
+                    claim_response = requests.post(claim_url, headers=headers, timeout=10)
+                    
+                    if claim_response.status_code == 200:
+                        return claimable_amount
+                        
+            return 0
+            
         except Exception as e:
-            print(f"{colored_text(f'❌ Error claiming fuel reward: {e}', Colors.RED)}")
-            return False
+            return 0
 
     def get_best_mech(self, match_id, team_preference=None):
         """Pilih mech terbaik berdasarkan win probability dan preferensi tim"""
@@ -520,55 +533,15 @@ class FarcasterAutoVote:
             print(f"{colored_text(f'❌ Error in get_best_mech: {e}', Colors.RED)}")
             return None
 
-    def claim_fuel_reward(self):
-        """Claim fuel reward jika tersedia"""
-        try:
-            print(f"⛽ Attempting to claim fuel reward...")
-            
-            # Endpoint untuk claim fuel reward
-            url = f"https://versus-prod-api.wreckleague.xyz/v1/user/fuelReward?fId={self.user_id}"
-            
-            headers = {
-                "Authorization": f"Bearer {self.authorization_token}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-            }
-            
-            response = requests.post(url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                result = response.json()
-                print(f"✅ Fuel reward claimed successfully!")
-                if 'fuel' in result:
-                    print(f"⛽ New fuel amount: {result['fuel']}")
-                elif 'data' in result and 'fuel' in result['data']:
-                    print(f"⛽ New fuel amount: {result['data']['fuel']}")
-                return True
-            else:
-                print(f"❌ Failed to claim fuel reward: {response.status_code}")
-                try:
-                    error_data = response.json()
-                    print(f"📄 Error details: {error_data}")
-                except:
-                    print(f"📄 Raw response: {response.text}")
-                return False
-                
-        except Exception as e:
-            print(f"❌ Error claiming fuel reward: {e}")
-            return False
-
     def get_match_details(self):
-        """Mendapatkan detail match terbaru - prioritas endpoint terstable"""
+        """Get match details - silent version"""
         try:
-            # Prioritas endpoint yang paling stabil
             endpoints = [
                 f"https://versus-prod-api.wreckleague.xyz/v1/match/details?fId={self.user_id}",
                 f"https://versus-prod-api.wreckleague.xyz/v1/analysis?fId={self.user_id}",
                 "https://versus-prod-api.wreckleague.xyz/v1/analysis"
             ]
             
-            # Headers yang lebih lengkap seperti di script asli
             headers = {
                 "accept": "*/*",
                 "accept-language": "en-US,en;q=0.9",
@@ -583,25 +556,18 @@ class FarcasterAutoVote:
                 "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"
             }
             
-            print(f"🔍 Getting match details for FID: {self.user_id}")
-            
-            for i, url in enumerate(endpoints, 1):
+            for url in endpoints:
                 try:
-                    print(f"� Trying primary endpoint {i}: {url.split('/')[-1]}")
                     response = requests.get(url, headers=headers, timeout=10)
-                    print(f"� Response status: {response.status_code}")
-                    
                     if response.status_code == 200:
-                        data = response.json()
-                        print(f"✅ Match details retrieved successfully from endpoint {i}")
-                        return data
-                    else:
-                        print(f"⚠️ Endpoint {i} returned {response.status_code}")
-                        
-                except Exception as e:
-                    print(f"❌ Endpoint {i} error: {e}")
+                        return response.json()
+                except:
                     continue
             
+            return None
+                
+        except Exception as e:
+            return None
             print("❌ All endpoints failed to get match details")
             return None
                 
@@ -627,7 +593,6 @@ class FarcasterAutoVote:
             
             if response.status_code == 200:
                 data = response.json()
-                print(f"🔍 Debug response structure: {json.dumps(data, indent=2)[:500]}...")
                 
                 if data.get('data') and data['data'].get('matchDetails'):
                     match_details = data['data']['matchDetails']
@@ -721,118 +686,56 @@ class FarcasterAutoVote:
         return best_mech
 
     def submit_prediction(self, fid=None, mech_id=None, match_id=None, fuel_points=None):
-        """Submit prediction/vote dengan fuel points dan auto claim fuel"""
+        """Submit prediction/vote - cleaner version"""
         try:
             fid = fid or self.user_id
             
-            # Auto check dan claim fuel sebelum voting
-            print(f"\n{colored_text('⛽ Checking fuel status before voting...', Colors.YELLOW)}")
+            # Get fuel info
             current_fuel = self.get_user_fuel_info()
-            print(f"{colored_text(f'💰 Available fuel: {current_fuel}', Colors.GREEN)}")
             
-            # Auto-detect latest match ID jika tidak disediakan
+            # Auto-detect match ID if needed
             if not match_id:
-                print(f"{colored_text('🔍 Auto-detecting latest match ID...', Colors.CYAN)}")
                 match_id = self.get_latest_match_id(fid)
                 if not match_id:
-                    print(f"{colored_text('❌ Could not auto-detect match ID', Colors.RED)}")
                     return False
-                print(f"{colored_text(f'✅ Using auto-detected match ID: {match_id}', Colors.GREEN)}")
             
-            # Ambil match details untuk data terbaru  
+            # Get match details
             match_details = self.get_match_details()
             if not match_details or 'data' not in match_details or not match_details['data']['matchData']:
-                print(f"{colored_text('❌ No active match found', Colors.RED)}")
                 return False
 
             current_match = match_details['data']['matchData'][0]
-            
-            # Cek apakah sudah vote - tapi tetap lanjut karena bisa vote tim yang sama
-            if current_match.get('isVoted', False):
-                print("ℹ️  Previous vote detected, checking if additional vote possible...")
-            
-            # Update match ID dari current match jika berbeda
             detected_match_id = current_match['_id']
             if match_id != detected_match_id:
-                print(f"🔄 Updating match ID: {match_id} → {detected_match_id}")
                 match_id = detected_match_id
             
-            # Auto-detect available mech IDs from current match
+            # Auto-detect available mechs
             available_mechs = current_match.get('mechIds', [])
-            if available_mechs:
-                print(f"🔍 Auto-detected available mechs: {available_mechs}")
             
-            # Pilih mech berdasarkan preferensi atau strategy
+            # Select mech based on preference
             if not mech_id and 'mechDetails' in current_match:
-                mech_details = current_match['mechDetails']
-                selected_mech = self.select_mech_by_preference(mech_details)
-                
+                selected_mech = self.select_mech_by_preference(current_match['mechDetails'])
                 if selected_mech:
                     mech_id = selected_mech['mechId']
-                    
-                    # Tampilkan info mech yang dipilih
-                    team_info = ""
-                    if len(mech_details) >= 2:
-                        mech_index = next((i for i, m in enumerate(mech_details) if m['mechId'] == mech_id), -1)
-                        if mech_index == 0:
-                            team_info = " (🔴 Tim Merah/Kiri)"  # Index 0 = Merah = Kiri
-                        elif mech_index == 1:
-                            team_info = " (🔵 Tim Biru/Kanan)"  # Index 1 = Biru = Kanan
-                    
-                    print(f"🎯 Selected mech {mech_id}{team_info}")
-                    
-                    # Safely get owner display name
-                    owner_name = "Unknown"
-                    if 'userData' in selected_mech and 'displayName' in selected_mech['userData']:
-                        owner_name = selected_mech['userData']['displayName']
-                    elif 'ownerName' in selected_mech:
-                        owner_name = selected_mech['ownerName']
-                    
-                    print(f"   👤 Owner: {owner_name}")
-                    print(f"   🏆 Win Probability: {selected_mech.get('winningProbability', 0)}%")
-                    print(f"   🗳️  Current Votes: {selected_mech.get('mechVotes', {}).get('voteCount', 0)}")
-                    print(f"   ⛽ Current Fuel: {selected_mech.get('mechVotes', {}).get('fuelPoints', 0)}")
-                else:
-                    # Fallback ke mech ID pertama yang tersedia dari current match
-                    available_mechs = current_match.get('mechIds', [])
-                    if available_mechs:
-                        mech_id = available_mechs[0]
-                        print(f"🎯 Using first available mech ID: {mech_id}")
-                    else:
-                        print("❌ No mech IDs available")
-                        return False
             elif not mech_id:
-                # Jika tidak ada mechDetails, gunakan mechIds yang tersedia
-                available_mechs = current_match.get('mechIds', [])
                 if available_mechs:
-                    mech_id = available_mechs[0]  # Ambil yang pertama
-                    print(f"🎯 Using first available mech ID: {mech_id}")
+                    mech_id = available_mechs[0]
                 else:
-                    print("❌ No mech data available")
                     return False
             
-            # Tentukan jumlah fuel berdasarkan setting
+            # Set fuel points
             if not fuel_points:
-                if self.fuel_amount:
-                    # Cek apakah fuel amount tidak melebihi max fuel dan available fuel
-                    max_usable = min(self.fuel_amount, self.max_fuel, current_fuel)
-                    fuel_points = max_usable
-                else:
-                    # Max strategy - gunakan semua fuel yang tersedia
+                if global_fuel_strategy == "max":
                     fuel_points = min(current_fuel, self.max_fuel)
-                
-                print(f"🎯 Fuel strategy: {'Custom/Conservative' if self.fuel_amount else 'Max Available'}")
-                print(f"💰 Current fuel: {current_fuel}, Max fuel: {self.max_fuel}")
-                print(f"⛽ Will use: {fuel_points} fuel points")
+                elif global_fuel_strategy == "conservative":
+                    fuel_points = min(1, current_fuel) if current_fuel >= 3 else 0
+                else:  # custom
+                    fuel_points = min(1, current_fuel) if current_fuel >= global_min_fuel_threshold else 0
             
-            # Cek apakah fuel cukup setelah auto claim
             if current_fuel < fuel_points:
-                print(f"❌ Insufficient fuel! Need {fuel_points}, have {current_fuel}")
                 return False
             
-            print(f"⛽ Using {fuel_points} fuel points for vote")
-            
-            # Payload untuk submit prediction
+            # Submit prediction
             payload = {
                 "fId": int(fid),
                 "mechId": str(mech_id),
@@ -840,7 +743,6 @@ class FarcasterAutoVote:
                 "fuelPoints": int(fuel_points)
             }
             
-            # Submit prediction
             url = "https://versus-prod-api.wreckleague.xyz/v2/matches/predict"
             headers = {
                 "accept": "*/*",
@@ -856,35 +758,11 @@ class FarcasterAutoVote:
                 "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36 Edg/139.0.0.0"
             }
             
-            print(f"\n{colored_text('🚀 Submitting prediction to blockchain...', Colors.BOLD + Colors.CYAN)}")
-            
-            # Create a beautiful prediction info box
-            pred_info = [
-                f"👤 FID: {fid}",
-                f"🤖 Mech ID: {mech_id}",
-                f"🎯 Match ID: {match_id[:10]}...{match_id[-10:]}",
-                f"⛽ Fuel Points: {fuel_points}"
-            ]
-            
-            print_colored_box("PREDICTION DETAILS", pred_info, Colors.CYAN)
-            
             response = requests.put(url, headers=headers, json=payload, timeout=10)
             
-            print(f"📡 API Response Status: {response.status_code}")
-            
             if response.status_code == 200:
-                result = response.json()
-                print_simple_status("🎉 Prediction submitted successfully! 🎯", "success")
                 return True
             else:
-                try:
-                    error_data = response.json()
-                    if 'message' in error_data:
-                        print_simple_status(f"❌ Error: {error_data['message']}", "error")
-                    else:
-                        print_simple_status(f"❌ Vote failed with status {response.status_code}", "error")
-                except:
-                    print_simple_status(f"❌ Vote failed: {response.text[:100]}...", "error")
                 return False
                 
         except Exception as e:
@@ -902,6 +780,14 @@ class FarcasterAutoVote:
             
             # Initialize vote counter
             self.votes_submitted = 0
+            
+            # Step 1: Check and claim fuel rewards before voting
+            print(f"\n{colored_text('🎁 Checking for fuel rewards...', Colors.CYAN)}")
+            try:
+                self.claim_fuel_reward()
+                time.sleep(1)  # Brief delay after claiming
+            except Exception as e:
+                print(f"{colored_text(f'⚠️ Fuel claim check failed, continuing: {e}', Colors.YELLOW)}")
             
             # Get match details
             match_details = self.get_match_details()
@@ -999,286 +885,168 @@ def process_single_account_vote(account_info, team_preference, fuel_strategy, cu
         return error_result
 
 def run_account_continuous_thread(account_info, thread_id, delay_config=None, team_preference="auto", fuel_strategy="max", min_fuel_threshold=1):
-    """Run continuous voting untuk satu akun dalam thread terpisah dengan enhanced match detection"""
+    """Run continuous voting untuk satu akun dalam thread terpisah"""
     try:
         account = account_info[thread_id]
-        fid = account['fid']
-        token = account['token']
-        fuel = account['fuel']
         
-        # Set unique random seed per thread untuk independent delays
+        # Set unique random seed per thread
         import time
         thread_seed = int(time.time() * 1000000) + thread_id * 1000 + account['index'] * 100
         random.seed(thread_seed)
-        print(f"🎲 [Thread-{thread_id+1}] Initialized independent random seed: {thread_seed}")
         
-        # Get delay configuration atau gunakan default
+        # Get delay configuration
         if delay_config:
             min_delay = delay_config.get('min_delay', 30)
             max_delay = delay_config.get('max_delay', 300)
         else:
-            min_delay, max_delay = 30, 300  # Default threading delay
+            min_delay, max_delay = 30, 300
         
-        print(f"\n🧵 [Thread-{thread_id+1}] Starting continuous voting for Account {account['index']} (FID: {fid})")
-        print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Delay config: {format_duration(min_delay)} - {format_duration(max_delay)} (for continuous mode)', Colors.MAGENTA)}")
-        
-        # Initialize bot untuk account ini dengan konfigurasi global
-        # Team preference conversion: "auto" -> None for FarcasterAutoVote
+        # Initialize bot
         bot_team_pref = None if team_preference == "auto" else team_preference
+        bot = FarcasterAutoVote(account['token'], None, 10, bot_team_pref, lazy_init=False)
         
-        # Create bot dengan fuel_amount = None untuk max strategy (akan detect real-time)
-        bot = FarcasterAutoVote(token, None, 10, bot_team_pref)
+        account_cycle_count = 0
+        last_match_id = None
+        is_first_vote = True
         
-        print(f"🎯 [Thread-{thread_id+1}] Fuel strategy: {fuel_strategy}")
-        print(f"⛽ [Thread-{thread_id+1}] Min fuel threshold: {min_fuel_threshold}")
+        # Silent startup - no verbose output
+        fid = bot.user_id
+        username = f"@account{account['index']}"
         
-        account_cycle_count = 0  # INDEPENDENT cycle counter per account
-        last_match_id = None  # Track match ID untuk deteksi match baru
-        is_first_vote = True  # Flag untuk voting pertama (no delay)
-        vote_delay_seconds = 0  # Default no delay untuk vote pertama
-        
-        while True:  # Continuous loop untuk account ini
+        while True:
             try:
-                account_cycle_count += 1  # Independent counter
+                account_cycle_count += 1
                 
-                # Real-time fuel detection untuk setiap voting cycle
-                current_account_fuel = bot.get_user_fuel_info()
-                print(f"\n💰 [Account-{account['index']}] Current fuel: {current_account_fuel}")
-                
-                # Determine fuel amount per cycle berdasarkan strategy dan fuel aktual
-                if fuel_strategy == "conservative":
-                    if current_account_fuel >= min_fuel_threshold:
-                        vote_fuel_amount = min_fuel_threshold
-                    else:
-                        print(f"⚠️ [Account-{account['index']}] Insufficient fuel for conservative strategy (need {min_fuel_threshold}, have {current_account_fuel})")
-                        time.sleep(300)  # Wait 5 minutes and check again
-                        continue
-                elif fuel_strategy == "custom":
-                    if current_account_fuel >= min_fuel_threshold:
-                        vote_fuel_amount = min_fuel_threshold
-                    else:
-                        print(f"⚠️ [Account-{account['index']}] Insufficient fuel for custom strategy (need {min_fuel_threshold}, have {current_account_fuel})")
-                        time.sleep(300)  # Wait 5 minutes and check again
-                        continue
-                else:  # max strategy
-                    if current_account_fuel >= min_fuel_threshold:
-                        vote_fuel_amount = current_account_fuel  # Use ALL available fuel
-                        print(f"🚀 [Account-{account['index']}] Max strategy: Will use ALL {vote_fuel_amount} fuel!")
-                    else:
-                        print(f"⚠️ [Account-{account['index']}] Insufficient fuel for max strategy (need min {min_fuel_threshold}, have {current_account_fuel})")
-                        time.sleep(300)  # Wait 5 minutes and check again
-                        continue
-                
-                # Update bot dengan fuel amount yang benar untuk cycle ini
-                bot.fuel_amount = vote_fuel_amount
-                
-                print(f"\n{colored_text('╔' + '═' * 68 + '╗', Colors.MAGENTA)}")
-                thread_text = f"🔄 [Account-{account['index']}] Personal Cycle #{account_cycle_count} (FID: {fid})"
-                print(f"{colored_text('║', Colors.MAGENTA)} {colored_text(thread_text, Colors.BOLD + Colors.WHITE):>60} {colored_text('║', Colors.MAGENTA)}")
-                print(f"{colored_text('╚' + '═' * 68 + '╝', Colors.MAGENTA)}")
-                
+                # Check fuel
                 current_fuel = bot.get_user_fuel_info()
-                print(f"{colored_text(f'⛽ [Account-{account['index']}] Current fuel: {current_fuel}', Colors.GREEN)}")
+                
+                # Skip if not enough fuel
+                if current_fuel < min_fuel_threshold:
+                    interruptible_sleep(30)  # Shorter sleep, interruptible
+                    continue
+                
+                # Simple cycle header
+                print_account_header(account['index'], fid, account_cycle_count)
+                print(f"⛽ Fuel: {current_fuel} | Strategy: {fuel_strategy}")
                 
                 # Get match details
                 match_details = bot.get_match_details()
                 if not match_details or 'data' not in match_details or not match_details['data']['matchData']:
-                    print(f"{colored_text(f'❌ [Account-{account['index']}] No active match found, waiting 2 minutes...', Colors.RED)}")
-                    time.sleep(120)
+                    print(f"❌ Account-{account['index']}: No match available")
+                    interruptible_sleep(30)  # Shorter sleep, interruptible
                     continue
                 
                 current_match = match_details['data']['matchData'][0]
-                match_id = current_match.get('_id', 'Unknown')
+                current_match_id = current_match.get('_id', '')
+                match_id_short = current_match_id[:10] + "..." if current_match_id else "Unknown"
                 
-                # Check if this is a new match
-                if last_match_id != match_id:
-                    print(f"{colored_text(f'🆕 [Account-{account['index']}] New match detected: {match_id[:10]}...', Colors.GREEN)}")
-                    last_match_id = match_id
-                    
-                    if is_first_vote:
-                        # Voting pertama - TANPA delay
-                        vote_delay_seconds = 0
-                        print(f"{colored_text(f'🚀 [Account-{account['index']}] First vote - NO DELAY (immediate voting)', Colors.GREEN)}")
-                        is_first_vote = False
-                    else:
-                        # Continuous voting - DENGAN delay random
-                        vote_delay_seconds = random.randint(min_delay, max_delay)
-                        print(f"{colored_text(f'🎲 [Account-{account['index']}] Continuous mode delay: {format_duration(vote_delay_seconds)} after voting starts', Colors.MAGENTA)}")
+                # Check timing
+                voting_start_str = current_match.get('votingStartTime')
+                voting_end_str = current_match.get('votingEndTime') or current_match.get('endTime')
                 
-                # PROPER timing detection dan handling
-                status, remaining_time = show_match_timing_info(current_match)
-                print(f"{colored_text(f'📊 [Account-{account['index']}] Match Status: {status.upper()}', Colors.CYAN)}")
+                if voting_start_str and voting_end_str:
+                    voting_start = parse_iso_time(voting_start_str)
+                    voting_end = parse_iso_time(voting_end_str)
+                    now_utc = datetime.datetime.now(pytz.UTC)
+                    
+                    if now_utc < voting_start:
+                        wait_time = (voting_start - now_utc).total_seconds()
+                        print_wait_message(account['index'], format_duration(wait_time))
+                        time.sleep(60)
+                        continue
+                    elif now_utc > voting_end:
+                        print(f"⌛ Account-{account['index']}: Voting ended, waiting for next match")
+                        time.sleep(60)
+                        continue
                 
-                if status == 'waiting':
-                    print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting not started yet, waiting {format_duration(remaining_time)}...', Colors.YELLOW)}")
-                    
-                    # Wait dengan countdown yang akurat
-                    voting_start_str = current_match.get('votingStartTime')
-                    if voting_start_str:
-                        voting_start = parse_iso_time(voting_start_str)
-                        
-                        while datetime.datetime.now(pytz.UTC) < voting_start:
-                            remaining = (voting_start - datetime.datetime.now(pytz.UTC)).total_seconds()
-                            if remaining <= 0:
-                                break
-                            print(f"{colored_text(f'⏰ [Thread-{thread_id+1}] Voting starts in {format_duration(remaining)}', Colors.CYAN)}", end='\r')
-                            time.sleep(min(30, remaining))
-                        
-                        print(f"\n{colored_text(f'🚀 [Thread-{thread_id+1}] Voting window opened!', Colors.GREEN)}")
-                        
-                        # Apply delay logic berdasarkan first vote atau continuous
-                        if vote_delay_seconds > 0:
-                            print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Waiting random delay {format_duration(vote_delay_seconds)} before voting...', Colors.MAGENTA)}")
-                            
-                            # Countdown untuk random delay
-                            delay_remaining = vote_delay_seconds
-                            while delay_remaining > 0:
-                                print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting in {format_duration(delay_remaining)}', Colors.YELLOW)}", end='\r')
-                                sleep_time = min(10, delay_remaining)  # Update setiap 10 detik
-                                time.sleep(sleep_time)
-                                delay_remaining -= sleep_time
-                            
-                            print(f"\n{colored_text(f'🎯 [Thread-{thread_id+1}] Random delay finished, voting now!', Colors.GREEN)}")
-                        else:
-                            print(f"{colored_text(f'🎯 [Thread-{thread_id+1}] No delay - voting immediately!', Colors.GREEN)}")
-                    
-                elif status == 'open':
-                    print(f"{colored_text(f'✅ [Thread-{thread_id+1}] Voting is open!', Colors.GREEN)}")
-                    
-                    # Check berapa lama voting sudah berjalan dan apply delay logic
-                    voting_start_str = current_match.get('votingStartTime')
-                    if voting_start_str and vote_delay_seconds > 0:
-                        voting_start = parse_iso_time(voting_start_str)
-                        now_utc = datetime.datetime.now(pytz.UTC)
-                        time_since_start = (now_utc - voting_start).total_seconds()
-                        
-                        if time_since_start < vote_delay_seconds:
-                            # Masih dalam periode delay, tunggu sisa delay
-                            remaining_delay = vote_delay_seconds - time_since_start
-                            print(f"{colored_text(f'🎲 [Thread-{thread_id+1}] Waiting remaining delay {format_duration(remaining_delay)}...', Colors.MAGENTA)}")
-                            
-                            while remaining_delay > 0:
-                                print(f"{colored_text(f'⏳ [Thread-{thread_id+1}] Voting in {format_duration(remaining_delay)}', Colors.YELLOW)}", end='\r')
-                                sleep_time = min(10, remaining_delay)
-                                time.sleep(sleep_time)
-                                remaining_delay -= sleep_time
-                            
-                            print(f"\n{colored_text(f'🎯 [Thread-{thread_id+1}] Random delay finished, voting now!', Colors.GREEN)}")
-                        else:
-                            print(f"{colored_text(f'🎯 [Thread-{thread_id+1}] Delay period passed, voting immediately!', Colors.GREEN)}")
-                    else:
-                        print(f"{colored_text(f'🎯 [Thread-{thread_id+1}] No delay - voting immediately!', Colors.GREEN)}")
-                    
-                    # Try to vote setelah delay
-                    success = bot.submit_prediction()
-                    
-                    if success:
-                        print(f"{colored_text(f'🎉 [Account-{account['index']}] Vote submitted successfully! 🎯', Colors.BOLD + Colors.GREEN)}")
-                        
-                        # PROPER WAIT sampai voting ends dengan timing detection yang akurat
-                        print(f"{colored_text(f'⏳ [Account-{account['index']}] Now waiting until voting window completely ends...', Colors.YELLOW)}")
-                        
-                        voting_end_str = current_match.get('votingEndTime') or current_match.get('endTime')
-                        if voting_end_str:
-                            voting_end = parse_iso_time(voting_end_str)
-                            
-                            # Real-time countdown sampai voting berakhir
-                            while datetime.datetime.now(pytz.UTC) < voting_end:
-                                remaining = (voting_end - datetime.datetime.now(pytz.UTC)).total_seconds()
-                                if remaining <= 0:
-                                    break
-                                print(f"{colored_text(f'⏰ [Account-{account['index']}] Voting ends in {format_duration(remaining)}', Colors.CYAN)}")
-                                time.sleep(min(30, remaining))
-                            
-                            print(f"\n{colored_text(f'✅ [Account-{account['index']}] Voting window ended! Searching for next match...', Colors.BLUE)}")
-                            
-                            # Wait for next match dengan proper detection
-                            print(f"{colored_text(f'🔍 [Account-{account['index']}] Intelligent next match detection...', Colors.CYAN)}")
-                            found_new_match, new_match_data = wait_for_next_match(bot, max_wait_minutes=30)
-                            
-                            if found_new_match:
-                                print(f"{colored_text(f'🎉 [Account-{account['index']}] Next match detected! Starting new personal cycle...', Colors.GREEN)}")
-                                last_match_id = None  # Reset untuk force detection match baru
-                                continue  # Langsung ke cycle berikutnya tanpa delay
-                            else:
-                                print(f"{colored_text(f'⚠️ [Account-{account['index']}] No next match found within 30 minutes, waiting 5 minutes before retry...', Colors.YELLOW)}")
-                                time.sleep(300)
-                        else:
-                            print(f"{colored_text(f'⚠️ [Account-{account['index']}] Could not get voting end time, waiting 5 minutes...', Colors.YELLOW)}")
-                            time.sleep(300)
-                    else:
-                        print(f"{colored_text(f'❌ [Account-{account['index']}] Vote failed, waiting 2 minutes before retry...', Colors.RED)}")
-                        time.sleep(120)
-                        
-                elif status == 'closed':
-                    print(f"{colored_text(f'⌛ [Account-{account['index']}] Voting window has closed, searching for next match...', Colors.BLUE)}")
-                    
-                    # Wait for next match dengan intelligent detection
-                    print(f"{colored_text(f'🔍 [Account-{account['index']}] Intelligent next match detection...', Colors.CYAN)}")
-                    found_new_match, new_match_data = wait_for_next_match(bot, max_wait_minutes=30)
-                    
-                    if found_new_match:
-                        print(f"{colored_text(f'🎉 [Account-{account['index']}] Next match detected! Starting new personal cycle...', Colors.GREEN)}")
-                        last_match_id = None  # Reset untuk force detection match baru
-                        continue  # Langsung ke cycle berikutnya
-                    else:
-                        print(f"{colored_text(f'⚠️ [Account-{account['index']}] No next match found within 30 minutes, waiting 5 minutes...', Colors.YELLOW)}")
-                        time.sleep(300)
-                    
+                # Check if new match
+                if current_match_id != last_match_id:
+                    print(f"🆕 Account-{account['index']}: New match {match_id_short}")
+                    last_match_id = current_match_id
+                    is_first_vote = True
+                
+                # Apply delay (except first vote)
+                if not is_first_vote:
+                    delay_seconds = random.randint(min_delay, max_delay)
+                    print_wait_message(account['index'], format_duration(delay_seconds))
+                    time.sleep(delay_seconds)
+                
+                # Submit vote
+                success = bot.submit_prediction()
+                
+                if success:
+                    print_vote_success(account['index'], match_id_short)
                 else:
-                    print(f"{colored_text(f'⚠️ [Account-{account['index']}] Unknown timing status: {status}, waiting 2 minutes...', Colors.YELLOW)}")
-                    time.sleep(120)
-                    
-                # Small delay before next cycle check (hanya jika tidak continue)
-                time.sleep(5)
+                    print(f"❌ Account-{account['index']}: Vote failed")
+                
+                is_first_vote = False
+                
+                # Wait until voting ends
+                if voting_end_str:
+                    voting_end = parse_iso_time(voting_end_str)
+                    now_utc = datetime.datetime.now(pytz.UTC)
+                    if voting_end > now_utc:
+                        remaining_time = (voting_end - now_utc).total_seconds()
+                        print_wait_message(account['index'], f"until voting ends ({format_duration(remaining_time)})")
+                        time.sleep(remaining_time + 30)  # Extra buffer
                 
             except Exception as e:
-                print(f"{colored_text(f'❌ [Account-{account['index']}] Error in personal cycle #{account_cycle_count}: {e}', Colors.RED)}")
-                time.sleep(60)  # Wait 1 minute on error
-                
+                print(f"❌ Account-{account['index']}: Error - {str(e)[:50]}")
+                time.sleep(30)
+                    
     except KeyboardInterrupt:
-        account_index = account.get('index', 'Unknown')
-        print(f"\n{colored_text(f'⛔ [Account-{account_index}] Personal thread stopped by user after {account_cycle_count} cycles', Colors.BOLD + Colors.RED)}")
-        # Force exit thread
-        import os
+        print(f"⛔ Account-{account['index']}: Thread stopped")
         os._exit(0)
     except Exception as e:
-        print(f"\n{colored_text(f'❌ [Account-{account['index']}] Personal thread error: {e}', Colors.RED)}")
-        # Force exit thread on critical error
-        import os
+        print(f"❌ Account-{account['index']}: Critical error - {str(e)[:50]}")
         os._exit(1)
 
 def threaded_continuous_multi_account_vote(active_accounts, delay_config=None, team_preference="auto", fuel_strategy="max", min_fuel_threshold=1):
-    """Run multi-account voting dengan threading - setiap akun punya continuous loop sendiri"""
+    """Run multi-account voting dengan threading - cleaner display"""
     import threading
     
-    print(f"\n🧵 Starting threaded continuous voting for {len(active_accounts)} accounts...")
-    print("⚠️  Each account will run in its own continuous loop")
-    print("⚠️  Press Ctrl+C to stop all threads")
-    
-    # Show delay configuration
-    if delay_config:
-        min_delay = delay_config.get('min_delay', 30)
-        max_delay = delay_config.get('max_delay', 300)
-        print(f"🎲 Random delay range: {format_duration(min_delay)} - {format_duration(max_delay)}")
+    print(f"\n{colored_text('🚀 MULTI-THREADED VOTING STARTED', Colors.BOLD + Colors.GREEN)}")
+    print(f"{colored_text(f'👥 Accounts: {len(active_accounts)} | Strategy: {fuel_strategy.title()}', Colors.CYAN)}")
+    print(f"{colored_text('⛔ Press Ctrl+C to stop all threads', Colors.YELLOW)}")
+    print(f"{colored_text('═' * 60, Colors.CYAN)}")
     
     threads = []
     
     try:
-        # Create dan start thread untuk setiap account
+        # Start threads silently
         for i, account in enumerate(active_accounts):
             thread = threading.Thread(
                 target=run_account_continuous_thread,
                 args=(active_accounts, i, delay_config, team_preference, fuel_strategy, min_fuel_threshold),
-                daemon=False,  # Changed to False agar bisa di-interrupt
+                daemon=False,
                 name=f"Account-{account['index']}-Thread"
             )
             threads.append(thread)
             thread.start()
-            print(f"🧵 Started thread for Account {account['index']} (FID: {account['fid']})")
-            time.sleep(2)  # Delay antar thread start
+            time.sleep(1)  # Small delay between starts
         
-        print(f"\n✅ All {len(threads)} threads started successfully!")
+        print(f"{colored_text(f'✅ {len(threads)} threads started successfully!', Colors.GREEN)}")
+        print(f"{colored_text('🔄 Monitoring account activities...', Colors.CYAN)}")
+        print(f"{colored_text('═' * 60, Colors.CYAN)}")
+        
+        # Monitor threads with better interrupt handling
+        try:
+            while any(thread.is_alive() for thread in threads):
+                time.sleep(0.1)  # Much shorter sleep for better responsiveness
+        except KeyboardInterrupt:
+            print(f"\n{colored_text('⛔ Ctrl+C detected! Stopping all threads...', Colors.RED)}")
+            # Force terminate all threads
+            for thread in threads:
+                thread.daemon = True
+            print(f"{colored_text('👋 Exiting forcefully...', Colors.YELLOW)}")
+            os._exit(0)
+            
+    except KeyboardInterrupt:
+        print(f"\n{colored_text('⛔ Multi-account voting stopped', Colors.RED)}")
+        os._exit(0)
+    except Exception as e:
+        print(f"\n{colored_text(f'❌ Threading error: {e}', Colors.RED)}")
+        os._exit(1)
         print("🔄 Threads are running continuously...")
         print("⛔ Press Ctrl+C to stop all threads")
         
@@ -1493,15 +1261,13 @@ def continuous_multi_account_vote(account_info, delay_config=None, team_preferen
     else:
         min_delay, max_delay = 5, 180  # Default sequential delay
     
-    # Filter account yang punya fuel
-    active_accounts = [acc for acc in account_info if acc['fuel'] > 0]
+    # Skip fuel filtering at startup - we'll check during voting
+    active_accounts = account_info  # Use all accounts, fuel check will happen during vote
     if not active_accounts:
-        print("❌ No accounts with fuel available!")
+        print("❌ No accounts available!")
         return
     
-    print(f"⛽ Active accounts with fuel: {len(active_accounts)}")
-    for acc in active_accounts:
-        print(f"   • Account {acc['index']} (FID: {acc['fid']}): {acc['fuel']} fuel")
+    print(f"⛽ Will check fuel for {len(active_accounts)} accounts during voting...")
     
     # Use global configuration instead of asking user
     print(f"\n{colored_text('🎯 Using global team preference:', Colors.YELLOW)} {colored_text(team_preference.title(), Colors.CYAN)}")
@@ -1617,23 +1383,66 @@ def continuous_multi_account_vote(account_info, delay_config=None, team_preferen
                     account_delays[acc['index']] = delay
                     print(f"🎲 Account {acc['index']} random delay: {format_duration(delay)}")
             
+            # SINGLE FUEL CHECK per cycle untuk semua account
+            print(f"\n{colored_text('🔍 Checking fuel status for all accounts (once per cycle)...', Colors.CYAN)}")
+            account_fuel_status = {}
+            
             for acc in active_accounts[:]:  # Copy list untuk avoid modification during iteration
-                print(f"\n{colored_text('┌─ Account Status ─' + '─' * 49 + '┐', Colors.CYAN)}")
                 acc_index = acc.get('index', 'Unknown')
                 acc_fid = acc.get('fid', 'Unknown')
-                print(f"{colored_text('│', Colors.CYAN)} {colored_text(f'👤 Account {acc_index}', Colors.BOLD + Colors.WHITE):<20} {colored_text(f'🆔 FID: {acc_fid}', Colors.YELLOW):<25} {colored_text('│', Colors.CYAN)}")
-                print(f"{colored_text('└' + '─' * 68 + '┘', Colors.CYAN)}")
+                
                 try:
-                    # Update fuel info
-                    temp_bot = FarcasterAutoVote(acc['token'], 1, 10, None)
-                    current_fuel = temp_bot.get_user_fuel_info()
+                    # Initialize if needed dan get fuel
+                    temp_bot = FarcasterAutoVote(acc['token'], 1, 10, None, lazy_init=True)
+                    if not acc['fid']:  # Update FID if not set
+                        acc['fid'] = temp_bot.ensure_initialized()
+                        acc_fid = acc['fid']
+                    else:
+                        temp_bot.user_id = acc['fid']  # Use cached FID
+                    
+                    current_fuel = temp_bot.get_user_fuel_info()  # First call with claim check
                     
                     if current_fuel <= 0:
                         print(f"{colored_text(f'❌ Account {acc_index}: No fuel remaining, removing from active list', Colors.RED)}")
                         active_accounts.remove(acc)
                         continue
                     
+                    # Cache fuel status
+                    account_fuel_status[acc_index] = {
+                        'fuel': current_fuel,
+                        'bot': temp_bot
+                    }
                     acc['fuel'] = current_fuel
+                    
+                    print(f"{colored_text(f'✅ Account {acc_index} (FID: {acc_fid}): {current_fuel} fuel', Colors.GREEN)}")
+                    
+                except Exception as e:
+                    print(f"{colored_text(f'❌ Account {acc_index}: Error checking fuel - {e}', Colors.RED)}")
+                    active_accounts.remove(acc)
+                    continue
+            
+            if not active_accounts:
+                print(f"{colored_text('❌ No accounts with fuel remaining!', Colors.RED)}")
+                break
+            
+            # Now vote with cached fuel info
+            for acc in active_accounts[:]:  # Copy list để avoid modification during iteration
+                print(f"\n{colored_text('┌─ Account Status ─' + '─' * 49 + '┐', Colors.CYAN)}")
+                acc_index = acc.get('index', 'Unknown')
+                acc_fid = acc.get('fid', 'Unknown')
+                print(f"{colored_text('│', Colors.CYAN)} {colored_text(f'👤 Account {acc_index}', Colors.BOLD + Colors.WHITE):<20} {colored_text(f'🆔 FID: {acc_fid}', Colors.YELLOW):<25} {colored_text('│', Colors.CYAN)}")
+                print(f"{colored_text('└' + '─' * 68 + '┘', Colors.CYAN)}")
+                
+                try:
+                    # Get cached fuel info
+                    if acc_index not in account_fuel_status:
+                        print(f"{colored_text(f'❌ Account {acc_index}: No fuel status cached, skipping', Colors.RED)}")
+                        continue
+                    
+                    fuel_info = account_fuel_status[acc_index]
+                    current_fuel = fuel_info['fuel']
+                    temp_bot = fuel_info['bot']
+                    
                     print(f"{colored_text(f'⛽ Current fuel: {current_fuel}', Colors.GREEN)}")
                     
                     # Determine fuel to use based on global strategy
@@ -1798,7 +1607,7 @@ def main():
     print(f"\n{colored_text('🔍 Initializing system...', Colors.YELLOW)}")
     
     # Load all tokens dari account.txt
-    print(f"{colored_text('� Loading authorization tokens...', Colors.BLUE)}")
+    print(f"{colored_text('📋 Loading authorization tokens...', Colors.BLUE)}")
     auth_tokens = load_authorization_token()
     if not auth_tokens:
         print(colored_text("❌ Error: Could not load any authorization tokens!", Colors.RED))
@@ -1806,51 +1615,26 @@ def main():
     
     print(f"{colored_text(f'✅ Successfully loaded {len(auth_tokens)} token(s)', Colors.GREEN)}")
     
-    # Detect fuel untuk semua account
-    print(f"\n{colored_text(f'🔍 Scanning fuel balance for {len(auth_tokens)} account(s)...', Colors.MAGENTA)}")
-    print(f"{colored_text('⏳ Please wait while detecting account information...', Colors.YELLOW)}")
+    # Skip fuel detection di startup - buat simple account info dulu
+    print(f"\n{colored_text(f'� Preparing {len(auth_tokens)} account(s) for configuration...', Colors.MAGENTA)}")
     account_info = []
     
     for i, token in enumerate(auth_tokens, 1):
-        print(f"{colored_text(f'🔄 Scanning Account {i}/{len(auth_tokens)}...', Colors.CYAN)}", end=' ')
-        try:
-            temp_bot = FarcasterAutoVote(token, 1, 10, None)
-            fuel = temp_bot.get_user_fuel_info()
-            username = temp_bot.user_id  # FID yang terdeteksi
-            
-            account_info.append({
-                'index': i,
-                'token': token,
-                'fid': username,
-                'fuel': fuel
-            })
-            
-            if fuel > 0:
-                print(f"{colored_text('✅ FOUND FUEL', Colors.GREEN)} - {colored_text(f'FID: {username}', Colors.WHITE)} {colored_text('|', Colors.CYAN)} {colored_text(f'Fuel: {fuel}', Colors.YELLOW)}")
-            else:
-                print(f"{colored_text('⛽ NO FUEL', Colors.RED)} - {colored_text(f'FID: {username}', Colors.WHITE)}")
-        except Exception as e:
-            print(f"{colored_text('❌', Colors.RED)} {colored_text(f'Error: {str(e)[:30]}...', Colors.RED)}")
-            account_info.append({
-                'index': i,
-                'token': token,
-                'fid': 'Unknown',
-                'fuel': 0
-            })
+        account_info.append({
+            'index': i,
+            'token': token,
+            'fid': None,  # Will be detected when needed
+            'fuel': None  # Will be checked when needed
+        })
     
-    if not account_info:
-        print(colored_text("\n❌ No valid accounts found!", Colors.RED))
-        return
+    print(f"{colored_text(f'✅ {len(account_info)} accounts ready for configuration', Colors.GREEN)}")
     
-    # Account summary with colors
-    total_fuel = sum(acc['fuel'] for acc in account_info)
-    active_accounts = len([acc for acc in account_info if acc['fuel'] > 0])
-    
+    # Account summary dengan info placeholder
     print(f"\n{colored_text('═' * 70, Colors.MAGENTA)}")
     print(f"{colored_text('📊 ACCOUNT SUMMARY', Colors.BOLD + Colors.MAGENTA)}")
     print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
-    print(f"{colored_text('💰 Total Fuel Available:', Colors.YELLOW)} {colored_text(str(total_fuel), Colors.GREEN if total_fuel > 0 else Colors.RED)}")
-    print(f"{colored_text('🟢 Active Accounts:', Colors.YELLOW)} {colored_text(f'{active_accounts}/{len(account_info)}', Colors.GREEN if active_accounts > 0 else Colors.RED)}")
+    print(f"{colored_text('� Total Accounts:', Colors.YELLOW)} {colored_text(str(len(account_info)), Colors.GREEN)}")
+    print(f"{colored_text('� Status:', Colors.YELLOW)} {colored_text('Ready for configuration (fuel will be checked before voting)', Colors.CYAN)}")
     print(f"{colored_text('═' * 70, Colors.MAGENTA)}")
     
     # Main menu options with colors
@@ -1869,23 +1653,44 @@ def main():
     action_choice = input(f"\n{colored_text('💫 Choose your action (1/2/3):', Colors.BOLD + Colors.YELLOW)} ").strip()
     
     if action_choice == "2":
-        # Check fuel status semua account with colors
+        # Check fuel status semua account with colors (on-demand)
+        print(f"\n{colored_text('🔍 Checking fuel status for all accounts...', Colors.CYAN)}")
+        print(f"{colored_text('⏳ Please wait while detecting account information...', Colors.YELLOW)}")
+        
         print(f"\n{colored_text('═' * 70, Colors.CYAN)}")
         print(f"{colored_text('⛽ DETAILED FUEL STATUS REPORT', Colors.BOLD + Colors.CYAN)}")
         print(f"{colored_text('═' * 70, Colors.CYAN)}")
         
-        for acc in account_info:
-            if acc['fuel'] > 0:
-                status_color = Colors.GREEN
-                fuel_color = Colors.GREEN
-                status_emoji = "🟢"
-            else:
+        for i, acc in enumerate(account_info, 1):
+            print(f"{colored_text(f'🔄 Scanning Account {i}/{len(account_info)}...', Colors.CYAN)}", end=' ')
+            try:
+                # Create bot with lazy init and check fuel
+                temp_bot = FarcasterAutoVote(acc['token'], 1, 10, None, lazy_init=True)
+                fid = temp_bot.ensure_initialized()
+                fuel = temp_bot.get_user_fuel_info()
+                
+                # Update account info
+                acc['fid'] = fid
+                acc['fuel'] = fuel
+                
+                if fuel > 0:
+                    status_emoji = "🟢"
+                    status_color = Colors.GREEN
+                    fuel_color = Colors.YELLOW
+                    print(f"{colored_text('✅ FOUND FUEL', Colors.GREEN)} - {colored_text(f'FID: {fid}', Colors.WHITE)} {colored_text('|', Colors.CYAN)} {colored_text(f'Fuel: {fuel}', Colors.YELLOW)}")
+                else:
+                    status_emoji = "🔴"
+                    status_color = Colors.RED
+                    fuel_color = Colors.RED
+                    print(f"{colored_text('⛽ NO FUEL', Colors.RED)} - {colored_text(f'FID: {fid}', Colors.WHITE)}")
+                    
+            except Exception as e:
+                print(f"{colored_text('❌', Colors.RED)} {colored_text(f'Error: {str(e)[:30]}...', Colors.RED)}")
+                acc['fid'] = 'Unknown'
+                acc['fuel'] = 0
+                status_emoji = "🔴"
                 status_color = Colors.RED
                 fuel_color = Colors.RED
-                status_emoji = "🔴"
-            
-            status_line = f"{status_emoji} Account {acc['index']:2d} │ FID: {acc['fid']:8s} │ Fuel: {acc['fuel']:3d}"
-            print(f"{colored_text(status_emoji, status_color)} {colored_text(f'Account {acc['index']:2d}', Colors.WHITE)} {colored_text('│', Colors.CYAN)} {colored_text(f'FID: {acc['fid']:8s}', Colors.YELLOW)} {colored_text('│', Colors.CYAN)} {colored_text(f'Fuel: {acc['fuel']:3d}', fuel_color)}")
         
         print(f"{colored_text('═' * 70, Colors.CYAN)}")
         return
@@ -2060,11 +1865,14 @@ def main():
         print(f"{colored_text('🧵 Using threaded execution mode...', Colors.GREEN)}")
         print(f"{colored_text('🎯 Each account will have independent continuous cycles...', Colors.GREEN)}")
         
-        # Filter active accounts untuk threading
-        active_accounts = [acc for acc in account_info if acc['fuel'] >= global_min_fuel_threshold]
+        # Since we skipped fuel check at startup, use all accounts for threading
+        # Fuel will be checked during the actual voting process
+        active_accounts = account_info  # Use all accounts, fuel check will happen during vote
         if not active_accounts:
-            print(f"{colored_text('❌ No accounts meet the fuel threshold!', Colors.RED)}")
+            print(f"{colored_text('❌ No accounts available!', Colors.RED)}")
             return
+            
+        print(f"{colored_text(f'📋 Will check fuel and start voting for {len(active_accounts)} accounts...', Colors.CYAN)}")
             
         threaded_continuous_multi_account_vote(
             active_accounts, 
